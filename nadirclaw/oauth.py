@@ -25,14 +25,6 @@ import webbrowser
 logger = logging.getLogger("nadirclaw")
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _b64decode(s: str) -> str:
-    """Decode a base64 string."""
-    return base64.b64decode(s).decode("utf-8")
-
-# ---------------------------------------------------------------------------
 # OAuth Configuration
 # ---------------------------------------------------------------------------
 
@@ -43,7 +35,7 @@ _CALLBACK_PATH = "/auth/callback"
 # OpenAI OAuth (PKCE)
 _OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 _OPENAI_AUTH_BASE = "https://auth.openai.com"
-_OPENAI_AUTHORIZE_URL = f"{_OPENAI_AUTH_BASE}/authorize"
+_OPENAI_AUTHORIZE_URL = f"{_OPENAI_AUTH_BASE}/oauth/authorize"
 _OPENAI_TOKEN_URL = f"{_OPENAI_AUTH_BASE}/oauth/token"
 _OPENAI_AUDIENCE = "https://api.openai.com/v1"
 _OPENAI_SCOPES = "openid profile email offline_access"
@@ -60,24 +52,12 @@ _GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 _GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 _GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json"
 
-# Google Antigravity OAuth — public OAuth client credentials (same as OpenClaw).
-# These are NOT secrets. Google's OAuth model for "installed applications" treats
-# client IDs as public identifiers. The actual security is in the per-user
-# access/refresh tokens obtained during the OAuth flow. This is the same pattern
-# used by gcloud CLI, Gemini CLI, and other Google desktop tools.
-# Override via env vars: NADIRCLAW_ANTIGRAVITY_CLIENT_ID / NADIRCLAW_ANTIGRAVITY_CLIENT_SECRET
-_ANTIGRAVITY_CLIENT_ID = (
-    os.getenv("NADIRCLAW_ANTIGRAVITY_CLIENT_ID")
-    or _b64decode(
-        "MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ=="
-    )
-)
-_ANTIGRAVITY_CLIENT_SECRET = (
-    os.getenv("NADIRCLAW_ANTIGRAVITY_CLIENT_SECRET")
-    or _b64decode(
-        "R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNYQzR6NnFEQWY="
-    )
-)
+# Google Antigravity OAuth — requires env vars for client credentials.
+# Set NADIRCLAW_ANTIGRAVITY_CLIENT_ID and NADIRCLAW_ANTIGRAVITY_CLIENT_SECRET
+# in your environment. These are Google "installed application" OAuth credentials
+# (same pattern as gcloud CLI, Gemini CLI, and other Google desktop tools).
+_ANTIGRAVITY_CLIENT_ID = os.getenv("NADIRCLAW_ANTIGRAVITY_CLIENT_ID", "")
+_ANTIGRAVITY_CLIENT_SECRET = os.getenv("NADIRCLAW_ANTIGRAVITY_CLIENT_SECRET", "")
 _ANTIGRAVITY_CALLBACK_PORT = 51121
 _ANTIGRAVITY_CALLBACK_PATH = "/oauth-callback"
 _ANTIGRAVITY_REDIRECT_URI = f"http://localhost:{_ANTIGRAVITY_CALLBACK_PORT}{_ANTIGRAVITY_CALLBACK_PATH}"
@@ -429,6 +409,11 @@ def refresh_gemini_token(refresh_token: str) -> dict:
 
 def refresh_antigravity_token(refresh_token: str) -> dict:
     """Refresh an Antigravity OAuth access token."""
+    if not _ANTIGRAVITY_CLIENT_ID or not _ANTIGRAVITY_CLIENT_SECRET:
+        raise RuntimeError(
+            "Antigravity OAuth credentials not configured. "
+            "Set NADIRCLAW_ANTIGRAVITY_CLIENT_ID and NADIRCLAW_ANTIGRAVITY_CLIENT_SECRET env vars."
+        )
     return _refresh_google_token(
         refresh_token,
         client_id=_ANTIGRAVITY_CLIENT_ID,
@@ -640,10 +625,15 @@ def _fetch_project_id_with_onboard(access_token: str) -> str:
 def login_antigravity(timeout: int = 300) -> Optional[dict]:
     """Run standalone Google Antigravity OAuth flow using account-based auth.
 
-    Uses hardcoded OAuth credentials (same as OpenClaw) — no env vars needed.
+    Requires NADIRCLAW_ANTIGRAVITY_CLIENT_ID and NADIRCLAW_ANTIGRAVITY_CLIENT_SECRET env vars.
 
     Returns dict with: access_token, refresh_token, expires_at, project_id, email — or None.
     """
+    if not _ANTIGRAVITY_CLIENT_ID or not _ANTIGRAVITY_CLIENT_SECRET:
+        raise RuntimeError(
+            "Antigravity OAuth credentials not configured. "
+            "Set NADIRCLAW_ANTIGRAVITY_CLIENT_ID and NADIRCLAW_ANTIGRAVITY_CLIENT_SECRET env vars."
+        )
     # Generate PKCE parameters
     code_verifier = _generate_code_verifier()
     code_challenge = _generate_code_challenge(code_verifier)
