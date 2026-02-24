@@ -777,6 +777,38 @@ def onboard():
     click.echo("  2. Verify:           openclaw doctor")
 
 
+@main.command()
+def learn():
+    """Analyze recent logs and update knowledge files."""
+    from nadirclaw.knowledge import learn_from_logs, seed_knowledge
+    from nadirclaw.settings import settings
+
+    seed_knowledge()
+    log_path = settings.LOG_DIR / "requests.jsonl"
+    click.echo(f"Analyzing logs from {log_path} ...")
+
+    result = learn_from_logs(log_path)
+    if result.get("status") == "no_data":
+        click.echo("No log entries found. Route some requests first.")
+        return
+
+    click.echo(f"Analyzed {result['entries_analyzed']} entries.")
+    stats = result.get("stats", {})
+    click.echo(f"  Error rate:    {stats.get('error_rate', 0)}%")
+    click.echo(f"  Fallback rate: {stats.get('fallback_rate', 0)}%")
+    click.echo(f"  Agentic:       {stats.get('agentic_count', 0)}")
+    click.echo(f"  Reasoning:     {stats.get('reasoning_count', 0)}")
+
+    model_summary = stats.get("model_summary", {})
+    if model_summary:
+        click.echo("\nModel breakdown:")
+        for model, s in sorted(model_summary.items()):
+            lat = f"{s['avg_latency_ms']:.0f}ms" if s.get("avg_latency_ms") else "N/A"
+            click.echo(f"  {model}: {s['requests']} reqs, {s['fallback_rate']}% fallback, {lat} avg")
+
+    click.echo(f"\nKnowledge files updated in ~/.nadirclaw/knowledge/")
+
+
 @main.group()
 def codex():
     """OpenAI Codex integration commands."""

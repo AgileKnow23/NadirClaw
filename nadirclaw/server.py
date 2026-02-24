@@ -24,6 +24,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from nadirclaw import __version__
 from nadirclaw.auth import UserSession, validate_local_auth
+from nadirclaw.events import event_bus
 from nadirclaw.settings import settings
 
 logger = logging.getLogger("nadirclaw")
@@ -954,6 +955,26 @@ async def chat_completions(
 
         _log_request(log_entry)
 
+        # Publish to event bus for real-time dashboard
+        asyncio.create_task(event_bus.publish({
+            "event_type": "routing_decision",
+            "request_id": request_id,
+            "tier": analysis_info.get("tier"),
+            "selected_model": selected_model,
+            "strategy": analysis_info.get("strategy"),
+            "confidence": analysis_info.get("confidence"),
+            "complexity_score": analysis_info.get("complexity_score"),
+            "classifier_latency_ms": analysis_info.get("classifier_latency_ms"),
+            "total_latency_ms": elapsed_ms,
+            "prompt_tokens": response_data["prompt_tokens"],
+            "completion_tokens": response_data["completion_tokens"],
+            "prompt_preview": prompt_text[:80],
+            "agentic": bool(analysis_info.get("routing_modifiers", {}).get("agentic", {}).get("is_agentic")),
+            "reasoning": bool(analysis_info.get("routing_modifiers", {}).get("reasoning", {}).get("is_reasoning")),
+            "fallback_used": analysis_info.get("fallback_from"),
+            "status": "ok",
+        }))
+
         # ------------------------------------------------------------------
         # Streaming response (SSE) — for OpenClaw / streaming clients
         # ------------------------------------------------------------------
@@ -1098,6 +1119,77 @@ async def view_logs(
 
 
 # ---------------------------------------------------------------------------
+# /v1/events/stream — real-time SSE stream of routing events
+# ---------------------------------------------------------------------------
+
+@app.get("/v1/events/stream")
+async def event_stream(current_user: UserSession = Depends(validate_local_auth)):
+    """Real-time SSE stream of routing events."""
+    queue = event_bus.subscribe()
+
+    async def generator():
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30)
+                    yield {"data": json.dumps(event, default=str)}
+                except asyncio.TimeoutError:
+                    yield {"data": json.dumps({"event_type": "heartbeat"})}
+        except asyncio.CancelledError:
+            pass
+        finally:
+            event_bus.unsubscribe(queue)
+
+    return EventSourceResponse(generator(), media_type="text/event-stream")
+
+
+# ---------------------------------------------------------------------------
+# /v1/dashboard — snapshot report with aggregated metrics
+# ---------------------------------------------------------------------------
+
+@app.get("/v1/dashboard")
+async def dashboard(
+    limit: int = 100,
+    current_user: UserSession = Depends(validate_local_auth),
+):
+    """Dashboard snapshot: aggregated metrics + recent events."""
+    from nadirclaw.report import load_log_entries, generate_report
+
+    entries = load_log_entries(settings.LOG_DIR / "requests.jsonl")
+    report = generate_report(entries[-limit:]) if entries else {}
+    recent_events = event_bus.get_history(20)
+
+    return {
+        "report": report,
+        "recent_events": recent_events,
+        "models": {
+            "simple": settings.SIMPLE_MODEL,
+            "complex": settings.COMPLEX_MODEL,
+            "reasoning": settings.REASONING_MODEL,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# /v1/knowledge — continuous learning endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/v1/knowledge")
+async def get_knowledge(current_user: UserSession = Depends(validate_local_auth)):
+    """Return current knowledge files content."""
+    from nadirclaw.knowledge import get_all_knowledge
+    return get_all_knowledge()
+
+
+@app.post("/v1/knowledge/learn")
+async def trigger_learning(current_user: UserSession = Depends(validate_local_auth)):
+    """Analyze recent logs and update knowledge files."""
+    from nadirclaw.knowledge import learn_from_logs
+    result = learn_from_logs(settings.LOG_DIR / "requests.jsonl")
+    return result
+
+
+# ---------------------------------------------------------------------------
 # /v1/models & /health
 # ---------------------------------------------------------------------------
 
@@ -1105,18 +1197,27 @@ async def view_logs(
 async def list_models(
     current_user: UserSession = Depends(validate_local_auth),
 ) -> Dict[str, Any]:
-    models = settings.tier_models
+    now = int(time.time())
+    # Routing profiles (virtual models that NadirClaw routes automatically)
+    routing_profiles = [
+        {"id": "auto", "object": "model", "created": now, "owned_by": "nadirclaw"},
+        {"id": "eco", "object": "model", "created": now, "owned_by": "nadirclaw"},
+        {"id": "premium", "object": "model", "created": now, "owned_by": "nadirclaw"},
+        {"id": "reasoning", "object": "model", "created": now, "owned_by": "nadirclaw"},
+    ]
+    # Backend models
+    backend_models = [
+        {
+            "id": m,
+            "object": "model",
+            "created": now,
+            "owned_by": m.split("/")[0] if "/" in m else "api",
+        }
+        for m in settings.tier_models
+    ]
     return {
         "object": "list",
-        "data": [
-            {
-                "id": m,
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": m.split("/")[0] if "/" in m else "api",
-            }
-            for m in models
-        ],
+        "data": routing_profiles + backend_models,
     }
 
 
