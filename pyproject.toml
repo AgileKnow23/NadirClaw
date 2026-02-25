@@ -31,6 +31,7 @@ dependencies = [
     "click",
     "google-genai>=1.0.0",
     "sse-starlette>=1.0.0",
+    "surrealdb>=1.0.0",
 ]
 
 [project.urls]

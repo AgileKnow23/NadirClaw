@@ -96,6 +96,85 @@ class Settings:
         return os.getenv("NADIRCLAW_FREE_MODEL", "") or self.SIMPLE_MODEL
 
     @property
+    def SURREALDB_URL(self) -> str:
+        return os.getenv("NADIRCLAW_SURREALDB_URL", "ws://localhost:8000")
+
+    @property
+    def SURREALDB_NS(self) -> str:
+        return os.getenv("NADIRCLAW_SURREALDB_NS", "nadirclaw")
+
+    @property
+    def SURREALDB_DB(self) -> str:
+        return os.getenv("NADIRCLAW_SURREALDB_DB", "nadirclaw")
+
+    @property
+    def SURREALDB_USER(self) -> str:
+        return os.getenv("NADIRCLAW_SURREALDB_USER", "root")
+
+    @property
+    def SURREALDB_PASS(self) -> str:
+        return os.getenv("NADIRCLAW_SURREALDB_PASS", "root")
+
+    @property
+    def SURREALDB_ENABLED(self) -> bool:
+        return os.getenv("NADIRCLAW_SURREALDB_ENABLED", "true").lower() in ("1", "true", "yes")
+
+    # ------------------------------------------------------------------
+    # BLAST prompt optimizer settings
+    # ------------------------------------------------------------------
+
+    @property
+    def BLAST_ENABLED(self) -> bool:
+        """Enable BLAST prompt restructuring before pipeline builder step."""
+        return os.getenv("NADIRCLAW_BLAST_ENABLED", "true").lower() in ("1", "true", "yes")
+
+    @property
+    def BLAST_SKIP_SIMPLE(self) -> bool:
+        """Skip BLAST optimization for simple_qa intent (too trivial to restructure)."""
+        return os.getenv("NADIRCLAW_BLAST_SKIP_SIMPLE", "true").lower() in ("1", "true", "yes")
+
+    @property
+    def BLAST_MODEL(self) -> str:
+        """Local model used for BLAST prompt restructuring. Should be fast."""
+        return os.getenv("NADIRCLAW_BLAST_MODEL", "") or self.SIMPLE_MODEL
+
+    # ------------------------------------------------------------------
+    # Pipeline settings
+    # ------------------------------------------------------------------
+
+    @property
+    def PIPELINE_ENABLED(self) -> bool:
+        """Enable the multi-model pipeline (Builder → Judge → Compressor)."""
+        return os.getenv("NADIRCLAW_PIPELINE_ENABLED", "true").lower() in ("1", "true", "yes")
+
+    @property
+    def PIPELINE_BUILDER(self) -> str:
+        """Default builder model for pipeline execution."""
+        return os.getenv("NADIRCLAW_PIPELINE_BUILDER", "") or self.COMPLEX_MODEL
+
+    @property
+    def PIPELINE_JUDGE(self) -> str:
+        """Default judge model for pipeline execution."""
+        return os.getenv("NADIRCLAW_PIPELINE_JUDGE", "") or self.REASONING_MODEL
+
+    @property
+    def PIPELINE_COMPRESSOR(self) -> str:
+        """Default compressor model for pipeline execution (small, fast model)."""
+        return os.getenv("NADIRCLAW_PIPELINE_COMPRESSOR", "") or self.SIMPLE_MODEL
+
+    @property
+    def PIPELINE_MAX_STEPS(self) -> int:
+        """Maximum pipeline steps before termination."""
+        return int(os.getenv("NADIRCLAW_PIPELINE_MAX_STEPS", "5"))
+
+    @property
+    def INTENT_CONFIDENCE_THRESHOLD(self) -> float:
+        """Minimum confidence for intent classification before falling back."""
+        return float(os.getenv("NADIRCLAW_INTENT_CONFIDENCE_THRESHOLD", "0.10"))
+
+    # ------------------------------------------------------------------
+
+    @property
     def has_explicit_tiers(self) -> bool:
         """True if SIMPLE_MODEL and COMPLEX_MODEL are explicitly set via env."""
         return bool(

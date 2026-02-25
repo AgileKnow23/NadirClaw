@@ -243,6 +243,124 @@ def build_centroids():
     click.echo(f"Centroid dimension: {simple_centroid.shape[0]}")
 
 
+@main.command(name="build-intent-centroids")
+def build_intent_centroids():
+    """Regenerate intent centroid .npy files from INTENT_PROTOTYPES."""
+    import logging
+
+    import numpy as np
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    from nadirclaw.encoder import get_shared_encoder_sync
+    from nadirclaw.prototypes import INTENT_PROTOTYPES
+
+    click.echo("Loading encoder...")
+    encoder = get_shared_encoder_sync()
+
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+
+    for category, prompts in INTENT_PROTOTYPES.items():
+        click.echo(f"Encoding {len(prompts)} '{category}' prototypes...")
+        embs = encoder.encode(prompts, show_progress_bar=False)
+        centroid = embs.mean(axis=0)
+        centroid = centroid / np.linalg.norm(centroid)
+
+        path = os.path.join(pkg_dir, f"intent_{category}_centroid.npy")
+        np.save(path, centroid.astype(np.float32))
+        click.echo(f"  Saved: {path}")
+
+    click.echo(f"\nGenerated {len(INTENT_PROTOTYPES)} intent centroid files.")
+    click.echo(f"Centroid dimension: {encoder.get_sentence_embedding_dimension()}")
+
+
+@main.group()
+def db():
+    """SurrealDB management commands."""
+    pass
+
+
+@db.command(name="init")
+def db_init():
+    """Initialize SurrealDB schema (create tables, indexes, analyzers)."""
+    import asyncio
+
+    from nadirclaw.settings import settings
+
+    if not settings.SURREALDB_ENABLED:
+        click.echo("SurrealDB is disabled. Set NADIRCLAW_SURREALDB_ENABLED=true to enable.")
+        return
+
+    click.echo(f"Connecting to SurrealDB at {settings.SURREALDB_URL} ...")
+
+    async def _init():
+        from nadirclaw.db import init_db, close_db, is_connected
+        await init_db()
+        if is_connected():
+            click.echo("Schema initialized successfully.")
+            click.echo(f"  Namespace: {settings.SURREALDB_NS}")
+            click.echo(f"  Database:  {settings.SURREALDB_DB}")
+            click.echo("  Tables:    request")
+            click.echo("  Indexes:   6 standard + 3 full-text search")
+            await close_db()
+        else:
+            click.echo("Failed to connect to SurrealDB. Is it running?")
+            click.echo(f"  Expected: {settings.SURREALDB_URL}")
+            click.echo("  Start with: surreal start --user root --pass root")
+            raise SystemExit(1)
+
+    asyncio.run(_init())
+
+
+@main.command()
+@click.argument("query")
+@click.option("--limit", default=10, help="Max results to return")
+def search(query, limit):
+    """Search conversation history via SurrealDB full-text search."""
+    import asyncio
+
+    from nadirclaw.settings import settings
+
+    if not settings.SURREALDB_ENABLED:
+        click.echo("SurrealDB is disabled. Set NADIRCLAW_SURREALDB_ENABLED=true to enable.")
+        return
+
+    async def _search():
+        from nadirclaw.db import init_db, close_db, is_connected, search_requests
+        await init_db()
+        if not is_connected():
+            click.echo("Cannot connect to SurrealDB. Is it running?")
+            raise SystemExit(1)
+
+        results = await search_requests(query, limit=limit)
+        await close_db()
+
+        if not results:
+            click.echo(f"No results found for: {query}")
+            return
+
+        click.echo(f"Found {len(results)} result(s) for: {query}\n")
+        for i, r in enumerate(results, 1):
+            ts = r.get("timestamp", "?")
+            model = r.get("selected_model", "?")
+            tier = r.get("tier", "?")
+            cost = r.get("estimated_cost_usd")
+            relevance = r.get("relevance", 0)
+            prompt = (r.get("prompt_text", "") or "")[:120]
+            response = (r.get("response_text", "") or "")[:120]
+
+            click.echo(f"  [{i}] {ts}  model={model}  tier={tier}  relevance={relevance:.2f}")
+            if cost is not None:
+                click.echo(f"      cost=${cost:.6f}")
+            if prompt:
+                click.echo(f"      prompt: {prompt}")
+            if response:
+                click.echo(f"      response: {response}")
+            click.echo()
+
+    asyncio.run(_search())
+
+
 @main.group()
 def auth():
     """Manage provider credentials (API keys and tokens)."""
@@ -807,6 +925,127 @@ def learn():
             click.echo(f"  {model}: {s['requests']} reqs, {s['fallback_rate']}% fallback, {lat} avg")
 
     click.echo(f"\nKnowledge files updated in ~/.nadirclaw/knowledge/")
+
+
+# ---------------------------------------------------------------------------
+# nadirclaw service — Windows service management
+# ---------------------------------------------------------------------------
+
+@main.group()
+def service():
+    """Manage NadirClaw + SurrealDB Windows services (NSSM)."""
+    pass
+
+
+@service.command(name="install")
+def service_install():
+    """Install NadirClaw and SurrealDB as Windows services (requires admin)."""
+    from nadirclaw.service_manager import (
+        _find_nssm,
+        get_service_configs,
+        install_all,
+    )
+
+    if not _find_nssm():
+        click.echo("NSSM not found. Install it first:")
+        click.echo("  Option 1: Run scripts/windows_service.ps1 (downloads NSSM automatically)")
+        click.echo("  Option 2: Download from https://nssm.cc and place nssm.exe in ~/.nadirclaw/bin/")
+        raise SystemExit(1)
+
+    configs = get_service_configs()
+    click.echo("Installing services:")
+    for name, cfg in configs.items():
+        click.echo(f"  {name}: {cfg['exe']}")
+
+    if install_all():
+        click.echo("\nAll services installed successfully.")
+        click.echo("They will auto-start on boot and auto-restart on crash.")
+        click.echo("Start now with: nadirclaw service start")
+    else:
+        click.echo("\nSome services failed to install. Check above for errors.")
+        click.echo("Make sure you're running as Administrator.")
+        raise SystemExit(1)
+
+
+@service.command(name="uninstall")
+def service_uninstall():
+    """Remove NadirClaw and SurrealDB Windows services."""
+    from nadirclaw.service_manager import uninstall_all
+
+    if not click.confirm("Remove NadirClaw services? This will stop them first.", default=False):
+        return
+
+    if uninstall_all():
+        click.echo("All services removed.")
+    else:
+        click.echo("Some services failed to remove. Run as Administrator.")
+        raise SystemExit(1)
+
+
+@service.command(name="start")
+def service_start():
+    """Start NadirClaw and SurrealDB services."""
+    from nadirclaw.service_manager import start_all
+
+    click.echo("Starting services...")
+    if start_all():
+        click.echo("All services started.")
+    else:
+        click.echo("Some services failed to start. Check: nadirclaw service status")
+        raise SystemExit(1)
+
+
+@service.command(name="stop")
+def service_stop():
+    """Stop NadirClaw and SurrealDB services."""
+    from nadirclaw.service_manager import stop_all
+
+    click.echo("Stopping services...")
+    if stop_all():
+        click.echo("All services stopped.")
+    else:
+        click.echo("Some services failed to stop.")
+        raise SystemExit(1)
+
+
+@service.command(name="status")
+def service_status():
+    """Show status of NadirClaw services."""
+    from nadirclaw.service_manager import get_all_status
+
+    statuses = get_all_status()
+    click.echo("NadirClaw Services")
+    click.echo("-" * 45)
+    for name, status_str in statuses.items():
+        icon = "OK" if status_str == "running" else "--"
+        click.echo(f"  [{icon}] {name:25s} {status_str}")
+
+
+@service.command(name="logs")
+@click.option("--service-name", "-s", default=None, help="Service name to tail (default: all)")
+@click.option("--lines", "-n", default=50, help="Number of lines to show")
+def service_logs(service_name, lines):
+    """Show recent service logs."""
+    from nadirclaw.service_manager import LOG_DIR, get_service_configs
+
+    configs = get_service_configs()
+    names = [service_name] if service_name else list(configs.keys())
+
+    for name in names:
+        log_file = LOG_DIR / f"{name}.log"
+        if not log_file.exists():
+            click.echo(f"\n--- {name} ---")
+            click.echo(f"  No log file found at {log_file}")
+            continue
+
+        click.echo(f"\n--- {name} (last {lines} lines) ---")
+        try:
+            with open(log_file) as f:
+                all_lines = f.readlines()
+                for line in all_lines[-lines:]:
+                    click.echo(f"  {line.rstrip()}")
+        except Exception as e:
+            click.echo(f"  Error reading log: {e}")
 
 
 @main.group()

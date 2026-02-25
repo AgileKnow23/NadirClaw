@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from threading import Lock
 from typing import Any, Dict, List, Optional, Union
 
+from contextlib import asynccontextmanager
+
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -24,23 +26,11 @@ from sse_starlette.sse import EventSourceResponse
 
 from nadirclaw import __version__
 from nadirclaw.auth import UserSession, validate_local_auth
+from nadirclaw.dispatch import RateLimitExhausted
 from nadirclaw.events import event_bus
 from nadirclaw.settings import settings
 
 logger = logging.getLogger("nadirclaw")
-
-
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
-
-class RateLimitExhausted(Exception):
-    """Raised when a model's rate limit is exhausted after retries."""
-
-    def __init__(self, model: str, retry_after: int = 60):
-        self.model = model
-        self.retry_after = retry_after
-        super().__init__(f"Rate limit exhausted for {model} (retry in {retry_after}s)")
 
 
 # ---------------------------------------------------------------------------
@@ -82,10 +72,26 @@ _rate_limiter = _RateLimiter()
 # App
 # ---------------------------------------------------------------------------
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if settings.SURREALDB_ENABLED:
+        from nadirclaw.db import init_db
+        await init_db()
+        # Crash recovery: mark stale running/pending pipelines as interrupted
+        from nadirclaw.pipeline_db import mark_interrupted_pipelines
+        interrupted = await mark_interrupted_pipelines()
+        if interrupted:
+            logger.info("Crash recovery: marked %d stale pipeline(s) as interrupted", interrupted)
+    yield
+    if settings.SURREALDB_ENABLED:
+        from nadirclaw.db import close_db
+        await close_db()
+
 app = FastAPI(
     title="NadirClaw",
     version=__version__,
     description="Open-source LLM router — simple prompts to free models, complex to premium",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -179,6 +185,14 @@ def _log_request(entry: Dict[str, Any]) -> None:
     with _log_lock:
         with open(request_log, "a") as f:
             f.write(line)
+
+    # Async SurrealDB write (fire-and-forget)
+    if settings.SURREALDB_ENABLED:
+        try:
+            from nadirclaw.db import insert_request
+            asyncio.get_event_loop().create_task(insert_request(entry))
+        except Exception:
+            pass  # DB failure should never block requests
 
     tier = entry.get("tier", "?")
     model = entry.get("selected_model", "?")
@@ -285,6 +299,23 @@ async def startup():
 
     logger.info("Ready! Listening for requests...")
     logger.info("=" * 60)
+
+    # Periodic pipeline state cleanup (every 6 hours)
+    if settings.SURREALDB_ENABLED:
+        asyncio.create_task(_periodic_state_cleanup())
+
+
+async def _periodic_state_cleanup():
+    """Periodically clean up old pipeline state records."""
+    while True:
+        await asyncio.sleep(6 * 3600)  # every 6 hours
+        try:
+            from nadirclaw.pipeline_db import cleanup_old_pipeline_states
+            deleted = await cleanup_old_pipeline_states(72)
+            if deleted:
+                logger.info("Pipeline state cleanup: removed %d old records", deleted)
+        except Exception as e:
+            logger.debug("Pipeline state cleanup error: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -838,6 +869,16 @@ async def chat_completions(
                 "confidence": 1.0,
                 "complexity_score": 0,
             }
+        elif request.model in ("pipeline", "nadirclaw/pipeline"):
+            # --- Route to pipeline execution ---
+            pipeline_req = PipelineRequest(
+                messages=request.messages,
+                model=None,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+            )
+            return await pipeline_endpoint(pipeline_req, current_user)
+
         elif request.model and request.model != "auto" and profile is None:
             # --- Check model aliases ---
             resolved = resolve_alias(request.model)
@@ -952,6 +993,21 @@ async def chat_completions(
                 {"role": m.role, "content": m.text_content()} for m in request.messages
             ]
             log_entry["raw_response"] = response_data.get("content", "")
+
+        # Enrich with cost estimate and full conversation for DB storage
+        from nadirclaw.routing import estimate_cost
+        log_entry["estimated_cost_usd"] = estimate_cost(
+            selected_model,
+            response_data["prompt_tokens"],
+            response_data["completion_tokens"],
+        )
+        log_entry["messages"] = [
+            {"role": m.role, "content": m.text_content()} for m in request.messages
+        ]
+        log_entry["response_text"] = response_data.get("content", "")
+        log_entry["system_prompt"] = next(
+            (m.text_content() for m in request.messages if m.role == "system"), ""
+        )
 
         _log_request(log_entry)
 
@@ -1171,6 +1227,44 @@ async def dashboard(
 
 
 # ---------------------------------------------------------------------------
+# /v1/search — full-text search via SurrealDB
+# ---------------------------------------------------------------------------
+
+@app.get("/v1/search")
+async def search_history(
+    q: str,
+    limit: int = 20,
+    current_user: UserSession = Depends(validate_local_auth),
+):
+    """Full-text search across all routing history."""
+    from nadirclaw.db import search_requests, is_connected
+    if not is_connected():
+        raise HTTPException(503, "SurrealDB not connected")
+    results = await search_requests(q, limit=limit)
+    return {"query": q, "results": results, "count": len(results)}
+
+
+# ---------------------------------------------------------------------------
+# /v1/history — filtered conversation history via SurrealDB
+# ---------------------------------------------------------------------------
+
+@app.get("/v1/history")
+async def request_history(
+    since: str = None,
+    model: str = None,
+    tier: str = None,
+    limit: int = 50,
+    current_user: UserSession = Depends(validate_local_auth),
+):
+    """Query request history from SurrealDB with filters."""
+    from nadirclaw.db import get_requests, is_connected
+    if not is_connected():
+        raise HTTPException(503, "SurrealDB not connected")
+    results = await get_requests(since=since, model=model, tier=tier, limit=limit)
+    return {"results": results, "count": len(results)}
+
+
+# ---------------------------------------------------------------------------
 # /v1/knowledge — continuous learning endpoints
 # ---------------------------------------------------------------------------
 
@@ -1190,6 +1284,324 @@ async def trigger_learning(current_user: UserSession = Depends(validate_local_au
 
 
 # ---------------------------------------------------------------------------
+# /v1/pipeline — multi-model pipeline execution
+# ---------------------------------------------------------------------------
+
+class PipelineRequest(BaseModel):
+    model_config = {"extra": "allow"}
+    messages: List[ChatMessage]
+    model: Optional[str] = None
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+
+
+@app.post("/v1/pipeline")
+async def pipeline_endpoint(
+    request: PipelineRequest,
+    current_user: UserSession = Depends(validate_local_auth),
+):
+    """Execute a multi-model pipeline (Builder -> Judge -> Compressor).
+
+    For simple queries, falls back to the standard chat completions endpoint.
+    Returns OpenAI-compatible response with nadirclaw_metadata.pipeline.
+    """
+    if not settings.PIPELINE_ENABLED:
+        raise HTTPException(400, "Pipeline is disabled. Set NADIRCLAW_PIPELINE_ENABLED=true.")
+
+    start_time = time.time()
+    request_id = str(uuid.uuid4())
+
+    # Rate limiting
+    retry_after = _rate_limiter.check(current_user.id)
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded. Retry after {retry_after}s.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    try:
+        # Classify intent
+        from nadirclaw.intent import get_intent_classifier
+
+        user_msgs = [m.text_content() for m in request.messages if m.role == "user"]
+        prompt_text = user_msgs[-1] if user_msgs else ""
+
+        classifier = get_intent_classifier()
+        intent_result = classifier.classify(prompt_text)
+
+        if not intent_result.needs_pipeline:
+            # Fall back to single-model routing
+            chat_req = ChatCompletionRequest(
+                messages=request.messages,
+                model=request.model,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+            )
+            return await chat_completions(chat_req, current_user)
+
+        # Execute pipeline
+        from nadirclaw.pipeline import (
+            cache_pipeline_result,
+            execute_pipeline,
+            pipeline_result_to_dict,
+        )
+
+        messages_raw = [
+            {"role": m.role, "content": m.text_content()} for m in request.messages
+        ]
+
+        # Model override: if user specified a concrete model, use it for builder
+        model_override = None
+        if request.model and request.model not in ("auto", "pipeline", "nadirclaw/pipeline", None):
+            model_override = request.model
+
+        pipeline_result = await execute_pipeline(
+            intent=intent_result.intent,
+            messages=messages_raw,
+            pipeline_id=request_id,
+            model_override=model_override,
+        )
+
+        cache_pipeline_result(pipeline_result)
+
+        # Store pipeline run in SurrealDB
+        if settings.SURREALDB_ENABLED:
+            try:
+                from nadirclaw.pipeline_db import insert_pipeline_run
+                asyncio.create_task(insert_pipeline_run(
+                    pipeline_id=pipeline_result.pipeline_id,
+                    intent=pipeline_result.intent,
+                    status=pipeline_result.status,
+                    total_latency_ms=pipeline_result.total_latency_ms,
+                    steps=[
+                        {
+                            "role": s.role,
+                            "model": s.model,
+                            "status": s.status,
+                            "latency_ms": s.latency_ms,
+                            "prompt_tokens": s.prompt_tokens,
+                            "completion_tokens": s.completion_tokens,
+                        }
+                        for s in pipeline_result.steps
+                    ],
+                    user_prompt_preview=prompt_text[:500],
+                    final_output_preview=pipeline_result.final_content[:500],
+                ))
+            except Exception:
+                pass
+
+        elapsed_ms = int((time.time() - start_time) * 1000)
+
+        # Sum tokens across all steps
+        total_prompt = sum(s.prompt_tokens for s in pipeline_result.steps)
+        total_completion = sum(s.completion_tokens for s in pipeline_result.steps)
+
+        # Log
+        _log_request({
+            "type": "pipeline",
+            "request_id": request_id,
+            "prompt": prompt_text,
+            "selected_model": "pipeline",
+            "tier": "pipeline",
+            "strategy": f"pipeline:{intent_result.intent}",
+            "confidence": intent_result.confidence,
+            "total_latency_ms": elapsed_ms,
+            "prompt_tokens": total_prompt,
+            "completion_tokens": total_completion,
+            "total_tokens": total_prompt + total_completion,
+            "status": pipeline_result.status,
+        })
+
+        return {
+            "id": request_id,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": "pipeline",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": pipeline_result.final_content,
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": total_prompt,
+                "completion_tokens": total_completion,
+                "total_tokens": total_prompt + total_completion,
+            },
+            "nadirclaw_metadata": {
+                "request_id": request_id,
+                "response_time_ms": elapsed_ms,
+                "intent": {
+                    "category": intent_result.intent,
+                    "confidence": intent_result.confidence,
+                    "keyword_boost": intent_result.keyword_boost,
+                },
+                "pipeline": pipeline_result_to_dict(pipeline_result),
+            },
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        logger.error("Pipeline error: %s", e, exc_info=True)
+        raise HTTPException(500, f"Pipeline error. Request ID: {request_id}")
+
+
+@app.get("/v1/pipeline/latest")
+async def pipeline_latest(
+    current_user: UserSession = Depends(validate_local_auth),
+):
+    """Get the most recent pipeline trace."""
+    from nadirclaw.pipeline import get_latest_pipeline, pipeline_result_to_dict
+
+    result = get_latest_pipeline()
+    if result is None:
+        return {"pipeline": None}
+    return {"pipeline": pipeline_result_to_dict(result)}
+
+
+@app.get("/v1/pipeline/stats")
+async def pipeline_stats_endpoint(
+    since: Optional[str] = None,
+    current_user: UserSession = Depends(validate_local_auth),
+):
+    """Get pipeline-specific stats (per-intent, per-role)."""
+    from nadirclaw.pipeline_db import get_pipeline_stats
+
+    stats = await get_pipeline_stats(since)
+    return {"stats": stats}
+
+
+@app.get("/v1/pipeline/{pipeline_id}/progress")
+async def pipeline_progress(
+    pipeline_id: str,
+    current_user: UserSession = Depends(validate_local_auth),
+):
+    """Get pipeline execution progress (live tracker -> SurrealDB fallback)."""
+    # Check in-memory tracker first (live pipelines)
+    from nadirclaw.pipeline_tracker import get_tracker
+    tracker = get_tracker(pipeline_id)
+    if tracker:
+        return {"progress": tracker.get_progress()}
+
+    # Fall back to SurrealDB (completed/interrupted pipelines)
+    if settings.SURREALDB_ENABLED:
+        from nadirclaw.pipeline_db import get_pipeline_state
+        state = await get_pipeline_state(pipeline_id)
+        if state:
+            return {"progress": state}
+
+    raise HTTPException(404, f"Pipeline {pipeline_id} not found")
+
+
+@app.get("/v1/pipeline/{request_id}")
+async def pipeline_by_id(
+    request_id: str,
+    current_user: UserSession = Depends(validate_local_auth),
+):
+    """Get a pipeline trace by request ID (cache -> SurrealDB)."""
+    from nadirclaw.pipeline import get_pipeline_by_id, pipeline_result_to_dict
+
+    # Check in-memory cache first
+    result = get_pipeline_by_id(request_id)
+    if result:
+        return {"pipeline": pipeline_result_to_dict(result)}
+
+    # Check SurrealDB
+    from nadirclaw.pipeline_db import get_pipeline_run
+
+    db_result = await get_pipeline_run(request_id)
+    if db_result:
+        return {"pipeline": db_result}
+
+    raise HTTPException(404, f"Pipeline run {request_id} not found")
+
+
+# ---------------------------------------------------------------------------
+# /v1/blast — BLAST prompt optimization preview
+# ---------------------------------------------------------------------------
+
+class BlastPreviewRequest(BaseModel):
+    prompt: str
+    intent: Optional[str] = None
+
+
+@app.post("/v1/blast")
+async def blast_preview(
+    request: BlastPreviewRequest,
+    current_user: UserSession = Depends(validate_local_auth),
+):
+    """Preview BLAST prompt optimization without executing the pipeline.
+
+    If intent is not provided, it will be auto-classified.
+    """
+    from nadirclaw.blast import get_blast_optimizer
+
+    if not settings.BLAST_ENABLED:
+        raise HTTPException(400, "BLAST is disabled. Set NADIRCLAW_BLAST_ENABLED=true.")
+
+    intent = request.intent
+    if not intent:
+        from nadirclaw.intent import get_intent_classifier
+        classifier = get_intent_classifier()
+        intent_result = classifier.classify(request.prompt)
+        intent = intent_result.intent
+
+    optimizer = get_blast_optimizer()
+    result = await optimizer.optimize(request.prompt, intent)
+
+    # Build execution plan showing which models will be engaged
+    from nadirclaw.blast import build_execution_plan
+    from nadirclaw.pipeline import _get_pipeline_configs
+
+    configs = _get_pipeline_configs()
+    config = configs.get(intent, configs.get("code_generation", {}))
+    plan = build_execution_plan(
+        intent=intent,
+        sections=result.sections,
+        pipeline_config=config,
+        blast_model=settings.BLAST_MODEL,
+        used_llm=result.used_llm,
+    )
+    result.execution_plan = plan
+
+    return {
+        "original_prompt": result.original_prompt,
+        "enhanced_prompt": result.enhanced_prompt,
+        "intent": result.intent,
+        "sections": result.sections,
+        "latency_ms": result.latency_ms,
+        "used_llm": result.used_llm,
+        "execution_plan": result.execution_plan,
+    }
+
+
+# ---------------------------------------------------------------------------
+# /v1/analytics — comprehensive analytics from SurrealDB
+# ---------------------------------------------------------------------------
+
+@app.get("/v1/analytics")
+async def analytics_endpoint(
+    since: Optional[str] = "30d",
+    current_user: UserSession = Depends(validate_local_auth),
+):
+    """Aggregated analytics from SurrealDB: totals, per-model, latency, strategy, pipeline health."""
+    from nadirclaw.db import get_analytics, is_connected
+
+    if not is_connected():
+        raise HTTPException(503, "SurrealDB not connected")
+
+    data = await get_analytics(since)
+    return {"since": since, "analytics": data}
+
+
+# ---------------------------------------------------------------------------
 # /v1/models & /health
 # ---------------------------------------------------------------------------
 
@@ -1204,6 +1616,10 @@ async def list_models(
         {"id": "eco", "object": "model", "created": now, "owned_by": "nadirclaw"},
         {"id": "premium", "object": "model", "created": now, "owned_by": "nadirclaw"},
         {"id": "reasoning", "object": "model", "created": now, "owned_by": "nadirclaw"},
+        {"id": "pipeline", "object": "model", "created": now, "owned_by": "nadirclaw",
+         "description": "Multi-model pipeline (Builder → Judge → Compressor)"},
+        {"id": "nadirclaw/pipeline", "object": "model", "created": now, "owned_by": "nadirclaw",
+         "description": "Multi-model pipeline (Builder → Judge → Compressor)"},
     ]
     # Backend models
     backend_models = [
