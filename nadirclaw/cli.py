@@ -92,6 +92,126 @@ def serve(port, simple_model, complex_model, models, token, verbose, log_raw):
 
 
 @main.command()
+@click.option("--port", default=None, type=int, help="Port for router (default: 8856)")
+@click.option("--verbose", is_flag=True, help="Enable verbose logging")
+def start(port, verbose):
+    """Start SurrealDB + NadirClaw router (one command, no NSSM needed)."""
+    import logging
+    import shutil
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+    log_level = "debug" if verbose else "info"
+    logging.basicConfig(
+        level=getattr(logging, log_level.upper()),
+        format="%(asctime)s %(levelname)-8s %(name)s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    from nadirclaw.settings import settings
+
+    # --- Locate SurrealDB ---
+    from nadirclaw.service_manager import _find_surreal
+
+    surreal = _find_surreal()
+    if not surreal:
+        surreal_path = shutil.which("surreal")
+        if surreal_path:
+            surreal = Path(surreal_path)
+        else:
+            click.echo("surreal.exe not found. Install SurrealDB first:")
+            click.echo("  https://surrealdb.com/install")
+            raise SystemExit(1)
+
+    # --- Start SurrealDB ---
+    data_dir = Path.home() / ".nadirclaw" / "surrealdb-data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    db_url = f"rocksdb://{str(data_dir).replace(chr(92), '/')}"
+
+    click.echo(f"Starting SurrealDB ({db_url}) ...")
+    surreal_proc = subprocess.Popen(
+        [
+            str(surreal), "start",
+            "--no-banner", "--log", "warn",
+            "--user", settings.SURREALDB_USER,
+            "--pass", settings.SURREALDB_PASS,
+            "--bind", "0.0.0.0:8000",
+            db_url,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+
+    # Wait for SurrealDB to be ready
+    import socket
+
+    for i in range(30):
+        try:
+            with socket.create_connection(("127.0.0.1", 8000), timeout=1):
+                break
+        except OSError:
+            time.sleep(0.5)
+    else:
+        click.echo("SurrealDB failed to start within 15s.")
+        stderr = surreal_proc.stderr.read().decode() if surreal_proc.stderr else ""
+        if stderr:
+            click.echo(stderr[:500])
+        surreal_proc.kill()
+        raise SystemExit(1)
+
+    click.echo("  SurrealDB ready on port 8000")
+
+    # --- Initialize schema ---
+    import asyncio
+
+    async def _init_schema():
+        from nadirclaw.db import close_db, init_db, is_connected
+        await init_db()
+        connected = is_connected()
+        await close_db()
+        return connected
+
+    if asyncio.run(_init_schema()):
+        click.echo("  Schema initialized")
+    else:
+        click.echo("  Warning: could not initialize schema")
+
+    # --- Start NadirClaw router ---
+    actual_port = port or settings.PORT
+    click.echo(f"Starting NadirClaw on port {actual_port} ...")
+    click.echo(f"  Simple model:  {settings.SIMPLE_MODEL}")
+    click.echo(f"  Complex model: {settings.COMPLEX_MODEL}")
+
+    import uvicorn
+
+    def _shutdown(signum, frame):
+        click.echo("\nShutting down ...")
+        surreal_proc.terminate()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    try:
+        uvicorn.run(
+            "nadirclaw.server:app",
+            host="0.0.0.0",
+            port=actual_port,
+            log_level=log_level,
+        )
+    finally:
+        click.echo("Stopping SurrealDB ...")
+        surreal_proc.terminate()
+        surreal_proc.wait(timeout=10)
+
+
+@main.command()
 @click.argument("prompt")
 def classify(prompt):
     """Classify a prompt as simple or complex (no server needed)."""

@@ -79,7 +79,7 @@ def get_service_configs() -> Dict[str, Dict[str, Any]]:
             "args": (
                 f"start --log info --user root --pass root "
                 f"--bind 0.0.0.0:8000 "
-                f"file://{str(data_dir).replace(chr(92), '/')}"
+                f"rocksdb://{str(data_dir).replace(chr(92), '/')}"
             ),
             "description": "NadirClaw SurrealDB instance",
             "depends_on": None,
