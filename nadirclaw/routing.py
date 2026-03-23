@@ -430,6 +430,7 @@ def apply_routing_modifiers(
     complex_model: str,
     reasoning_model: Optional[str] = None,
     free_model: Optional[str] = None,
+    local_reasoning_model: Optional[str] = None,
 ) -> Tuple[str, str, Dict[str, Any]]:
     """Apply all routing modifiers on top of the classifier's base decision.
 
@@ -456,13 +457,21 @@ def apply_routing_modifiers(
     routing_info["agentic"] = agentic
 
     if agentic["is_agentic"] and final_tier == "simple":
-        final_model = complex_model
-        final_tier = "complex"
-        routing_info["modifiers_applied"].append("agentic_override")
-        logger.info(
-            "Agentic override: simple → complex (confidence=%.2f, signals=%s)",
-            agentic["confidence"], agentic["signals"],
-        )
+        # Only escalate to cloud if complexity is meaningful
+        if request_meta.get("complexity_score", 0.5) >= 0.40:
+            final_model = complex_model
+            final_tier = "complex"
+            routing_info["modifiers_applied"].append("agentic_override")
+            logger.info(
+                "Agentic override: simple → complex (confidence=%.2f, signals=%s)",
+                agentic["confidence"], agentic["signals"],
+            )
+        else:
+            routing_info["modifiers_applied"].append("agentic_local_kept")
+            logger.info(
+                "Agentic detected but low complexity (%.2f) — keeping local model",
+                request_meta.get("complexity_score", 0.5),
+            )
 
     # --- Reasoning detection ---
     prompt_text = ""
@@ -479,14 +488,18 @@ def apply_routing_modifiers(
     routing_info["reasoning"] = reasoning
 
     if reasoning["is_reasoning"]:
-        target = reasoning_model or complex_model
+        complexity_score = request_meta.get("complexity_score", 0.5)
+        if complexity_score < 0.40 and local_reasoning_model:
+            target = local_reasoning_model
+        else:
+            target = reasoning_model or complex_model
         if final_model != target:
             final_model = target
             final_tier = "reasoning"
             routing_info["modifiers_applied"].append("reasoning_override")
             logger.info(
-                "Reasoning override: → %s (markers=%d: %s)",
-                target, reasoning["marker_count"], reasoning["markers"],
+                "Reasoning override: → %s (complexity=%.2f, markers=%d: %s)",
+                target, complexity_score, reasoning["marker_count"], reasoning["markers"],
             )
 
     # --- Context window check ---

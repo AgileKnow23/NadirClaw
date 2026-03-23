@@ -30,6 +30,20 @@ from nadirclaw.dispatch import RateLimitExhausted
 from nadirclaw.events import event_bus
 from nadirclaw.settings import settings
 
+# ── Pipeline V2 Extension ────────────────────────────────────────────────────
+from nadirclaw.orchestrator import PipelineOrchestrator
+from nadirclaw.classifier_v2 import classify_v2
+
+# ── Parallel Dispatch Extension ──────────────────────────────────────────────
+from nadirclaw.parallel_dispatch import (
+    should_parallel_dispatch, parallel_dispatch, get_model_pair, format_parallel_response,
+)
+
+_pipeline_orchestrator = PipelineOrchestrator(
+    base_url=f"http://localhost:{settings.PORT}/v1"
+)
+# ──────────────────────────────────────────────────────────────────────────────
+
 logger = logging.getLogger("nadirclaw")
 
 
@@ -334,14 +348,20 @@ async def _smart_route_analysis(
         result = await analyzer.analyze(text=prompt, system_message=system_message)
 
         is_complex = result.get("tier_name") == "complex"
-        selected = settings.COMPLEX_MODEL if is_complex else settings.SIMPLE_MODEL
+
+        # Use classifier_v2 for multi-tier model selection
+        complexity_score = result.get("complexity_score", 0.5)
+        clf2 = classify_v2(prompt, complexity_score)
+        selected = clf2.routed_model
 
         analysis = {
             "strategy": "smart-routing",
             "analyzer": result.get("analyzer_type", "binary"),
             "selected_model": selected,
-            "complexity_score": result.get("complexity_score"),
-            "tier": result.get("tier_name"),
+            "complexity_score": complexity_score,
+            "tier": clf2.tier,
+            "task_type": clf2.task_type,
+            "v2_tier": clf2.tier,
             "confidence": result.get("confidence"),
             "reasoning": result.get("reasoning"),
             "classifier_latency_ms": result.get("analyzer_latency_ms"),
@@ -477,8 +497,21 @@ async def _call_gemini(
     if not api_key:
         raise HTTPException(
             status_code=500,
-            detail="No Google/Gemini API key configured. "
-                   "Set GEMINI_API_KEY or GOOGLE_API_KEY, or run: nadirclaw auth add -p google",
+            detail="No Google/Gemini credential configured. "
+                   "Run: nadirclaw auth gemini login",
+        )
+
+    # OAuth token → use cloudcode-pa Code Assist endpoint
+    if api_key.startswith("ya29."):
+        from nadirclaw.dispatch import _call_gemini_oauth
+        messages = []
+        for m in request.messages:
+            messages.append({"role": m.role, "content": m.text_content()})
+        return await _call_gemini_oauth(
+            model, messages, api_key,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            _retry_count=_retry_count,
         )
 
     client = _get_gemini_client(api_key)
@@ -698,6 +731,22 @@ async def _dispatch_model(
     with trace_span("dispatch_model", {"gen_ai.request.model": model, "gen_ai.system": provider or ""}):
         if provider == "google":
             return await _call_gemini(model, request, provider)
+        if provider == "anthropic":
+            from nadirclaw.dispatch import _call_claude_cli
+            messages = [{"role": m.role, "content": m.text_content()} for m in request.messages]
+            return await _call_claude_cli(
+                model, messages,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+            )
+        if provider == "openai-codex":
+            from nadirclaw.dispatch import _call_codex_cli
+            messages = [{"role": m.role, "content": m.text_content()} for m in request.messages]
+            return await _call_codex_cli(
+                model, messages,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+            )
         return await _call_litellm(model, request, provider)
 
 
@@ -815,6 +864,48 @@ async def chat_completions(
     start_time = time.time()
     request_id = str(uuid.uuid4())
 
+    # --- Pipeline V2: force_model bypass (prevents re-routing for orchestrator self-calls) ---
+    extra = request.model_extra or {}
+    force_model = extra.get("x_nadirclaw_force_model", False)
+
+    if force_model and request.model:
+        from nadirclaw.credentials import detect_provider
+        from nadirclaw.telemetry import record_llm_call, trace_span
+
+        provider = detect_provider(request.model)
+        try:
+            response_data, _, _ = await _call_with_fallback(
+                request.model, request, provider, {"strategy": "force_model", "tier": "direct"},
+            )
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            content = response_data.get("content", "")
+
+            if request.stream:
+                return _build_streaming_response(
+                    request_id, request.model, response_data,
+                    {"strategy": "force_model"}, elapsed_ms,
+                )
+
+            return {
+                "id": request_id,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": request.model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": response_data.get("finish_reason", "stop"),
+                }],
+                "usage": {
+                    "prompt_tokens": response_data.get("prompt_tokens", 0),
+                    "completion_tokens": response_data.get("completion_tokens", 0),
+                    "total_tokens": response_data.get("prompt_tokens", 0) + response_data.get("completion_tokens", 0),
+                },
+            }
+        except Exception as e:
+            logger.error("Force-model dispatch failed for %s: %s", request.model, e)
+            raise HTTPException(status_code=500, detail=f"Force-model dispatch failed: {e}")
+
     try:
         # Extract prompt for logging
         user_msgs = [m.text_content() for m in request.messages if m.role == "user"]
@@ -922,6 +1013,9 @@ async def chat_completions(
                     request.messages, current_user
                 )
 
+                # Inject complexity score so routing modifiers can use it
+                req_meta["complexity_score"] = analysis_info.get("complexity_score", 0.5)
+
                 # Apply routing modifiers (agentic, reasoning, context window)
                 selected_model, final_tier, routing_info = apply_routing_modifiers(
                     base_model=selected_model,
@@ -932,6 +1026,7 @@ async def chat_completions(
                     complex_model=settings.COMPLEX_MODEL,
                     reasoning_model=settings.REASONING_MODEL,
                     free_model=settings.FREE_MODEL,
+                    local_reasoning_model=settings.LOCAL_REASONING_MODEL,
                 )
                 analysis_info["tier"] = final_tier
                 analysis_info["selected_model"] = selected_model
@@ -939,6 +1034,179 @@ async def chat_completions(
 
                 # Cache this decision for session persistence
                 session_cache.put(request.messages, selected_model, final_tier)
+
+        # ── Parallel Dispatch gate ───────────────────────────────────────
+        # For moderate/complex tiers, dispatch two models in parallel and
+        # return a combined response with judge comparison.
+        complexity_score_pd = analysis_info.get("complexity_score", 0) or 0
+        tier_pd = analysis_info.get("tier", "simple")
+        clf2_pd = classify_v2(prompt_text, complexity_score_pd) if complexity_score_pd >= 0.40 else None
+        if clf2_pd and should_parallel_dispatch(
+            complexity=clf2_pd.complexity,
+            tier=clf2_pd.tier,
+            privacy_required=clf2_pd.privacy_required,
+            speed_priority=clf2_pd.speed_priority,
+        ):
+            model_a, model_b = get_model_pair(clf2_pd.tier, clf2_pd.task_type)
+            logger.info(
+                "Parallel dispatch | tier=%s | task_type=%s | A=%s | B=%s",
+                clf2_pd.tier, clf2_pd.task_type, model_a, model_b,
+            )
+            try:
+                raw_messages = [
+                    {"role": m.role, "content": m.content}
+                    for m in request.messages
+                ]
+                pd_result = await parallel_dispatch(
+                    messages=raw_messages,
+                    model_a=model_a,
+                    model_b=model_b,
+                    judge_model=settings.PARALLEL_JUDGE_MODEL,
+                    prompt_text=prompt_text,
+                    temperature=request.temperature,
+                    max_tokens=request.max_tokens,
+                )
+                combined_content = format_parallel_response(pd_result)
+                elapsed_ms = int((time.time() - start_time) * 1000)
+
+                _log_request({
+                    "type": "completion",
+                    "request_id": request_id,
+                    "prompt": prompt_text,
+                    "selected_model": "nadirclaw/parallel",
+                    "tier": clf2_pd.tier,
+                    "task_type": clf2_pd.task_type,
+                    "complexity_score": clf2_pd.complexity,
+                    "total_latency_ms": elapsed_ms,
+                    "parallel_dispatch": True,
+                    "model_a": model_a,
+                    "model_b": model_b,
+                    "preferred": pd_result.preferred,
+                    "latency_a_ms": pd_result.latency_a_ms,
+                    "latency_b_ms": pd_result.latency_b_ms,
+                    "status": "ok",
+                    **req_meta,
+                })
+
+                pd_metadata = {
+                    "request_id": request_id,
+                    "response_time_ms": elapsed_ms,
+                    "parallel_dispatch": True,
+                    "model_a": model_a,
+                    "model_b": model_b,
+                    "preferred": pd_result.preferred_model,
+                    "latency_a_ms": pd_result.latency_a_ms,
+                    "latency_b_ms": pd_result.latency_b_ms,
+                    "tier": clf2_pd.tier,
+                    "task_type": clf2_pd.task_type,
+                }
+
+                if request.stream:
+                    fake_response = {
+                        "content": combined_content,
+                        "finish_reason": "stop",
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                    }
+                    return _build_streaming_response(
+                        request_id, "nadirclaw/parallel", fake_response,
+                        {"strategy": "parallel_dispatch"}, elapsed_ms,
+                    )
+
+                return {
+                    "id": request_id,
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": "nadirclaw/parallel",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": combined_content,
+                        },
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    "nadirclaw_metadata": pd_metadata,
+                }
+            except Exception as exc:
+                logger.error("Parallel dispatch failed (%s) — falling back to single-model.", exc)
+                # Fall through to Pipeline V2 gate / single-model dispatch
+        # ─────────────────────────────────────────────────────────────────
+
+        # ── Pipeline V2 gate ─────────────────────────────────────────────
+        # If V2 is enabled and complexity is high enough, run the orchestrator
+        if settings.PIPELINE_V2_ENABLED:
+            complexity_score = analysis_info.get("complexity_score", 0) or 0
+            if _pipeline_orchestrator.should_pipeline(prompt_text, complexity_score):
+                clf2 = classify_v2(prompt_text, complexity_score)
+                logger.info(
+                    "Pipeline V2 activated | task_type=%s | complexity=%.2f | tier=%s",
+                    clf2.task_type, clf2.complexity, clf2.tier,
+                )
+                try:
+                    pipeline_result = await _pipeline_orchestrator.run(
+                        prompt=prompt_text,
+                        complexity=clf2.complexity,
+                        privacy_required=clf2.privacy_required,
+                    )
+                    elapsed_ms = int((time.time() - start_time) * 1000)
+                    _log_request({
+                        "type": "completion",
+                        "request_id": request_id,
+                        "prompt": prompt_text,
+                        "selected_model": "nadirclaw/pipeline-v2",
+                        "tier": clf2.tier,
+                        "task_type": clf2.task_type,
+                        "complexity_score": clf2.complexity,
+                        "total_latency_ms": elapsed_ms,
+                        "pipeline_v2": True,
+                        "models_used": pipeline_result.models_used,
+                        "subtasks": len(pipeline_result.subtask_results),
+                        "status": "ok",
+                        **req_meta,
+                    })
+
+                    if request.stream:
+                        fake_response = {
+                            "content": pipeline_result.final_response,
+                            "finish_reason": "stop",
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                        }
+                        return _build_streaming_response(
+                            request_id, "nadirclaw/pipeline-v2", fake_response,
+                            {"strategy": "pipeline_v2"}, elapsed_ms,
+                        )
+
+                    return {
+                        "id": request_id,
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": "nadirclaw/pipeline-v2",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": pipeline_result.final_response,
+                            },
+                            "finish_reason": "stop",
+                        }],
+                        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                        "nadirclaw_metadata": {
+                            "request_id": request_id,
+                            "response_time_ms": elapsed_ms,
+                            "pipeline_v2": True,
+                            "models_used": pipeline_result.models_used,
+                            "subtask_count": len(pipeline_result.subtask_results),
+                            "task_type": clf2.task_type,
+                            "tier": clf2.tier,
+                        },
+                    }
+                except Exception as exc:
+                    logger.error("Pipeline V2 failed (%s) — falling back to single-model routing.", exc)
+                    # Fall through to existing single-model dispatch below
+        # ─────────────────────────────────────────────────────────────────
 
         # Resolve provider credential
         from nadirclaw.credentials import detect_provider, get_credential

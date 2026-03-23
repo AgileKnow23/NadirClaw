@@ -484,7 +484,14 @@ def search(query, limit):
 @main.group()
 def auth():
     """Manage provider credentials (API keys and tokens)."""
-    pass
+    from pathlib import Path
+    from dotenv import load_dotenv
+
+    env_file = Path.home() / ".nadirclaw" / ".env"
+    if env_file.exists():
+        load_dotenv(env_file)
+    else:
+        load_dotenv()
 
 
 @auth.command(name="setup-token")
