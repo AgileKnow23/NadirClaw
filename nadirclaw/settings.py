@@ -174,6 +174,63 @@ class Settings:
 
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Pipeline V2 (multi-model orchestrator) settings
+    # ------------------------------------------------------------------
+
+    @property
+    def PIPELINE_V2_ENABLED(self) -> bool:
+        """Enable Pipeline V2 orchestrator for high-complexity requests."""
+        return os.getenv("NADIRCLAW_PIPELINE_V2_ENABLED", "false").lower() in ("1", "true", "yes")
+
+    @property
+    def PIPELINE_V2_THRESHOLD(self) -> float:
+        """Complexity score threshold to auto-trigger Pipeline V2."""
+        return float(os.getenv("NADIRCLAW_PIPELINE_V2_THRESHOLD", "0.82"))
+
+    @property
+    def TRIVIAL_MODEL(self) -> str:
+        """Ultra-fast trivial model."""
+        return os.getenv("NADIRCLAW_TRIVIAL_MODEL", "ollama/qwen2.5:3b")
+
+    @property
+    def CODE_MODEL(self) -> str:
+        """Local code specialist model."""
+        return os.getenv("NADIRCLAW_CODE_MODEL", "ollama/qwen3-coder:30b")
+
+    @property
+    def FAST_CLOUD_MODEL(self) -> str:
+        """Fast cloud model (Gemini Flash etc.)."""
+        return os.getenv("NADIRCLAW_FAST_CLOUD_MODEL", "gemini/gemini-2.0-flash")
+
+    @property
+    def CODE_CLOUD_MODEL(self) -> str:
+        """Cloud code agent model (Codex CLI)."""
+        return os.getenv("NADIRCLAW_CODE_CLOUD_MODEL", "openai-codex/gpt-5-codex")
+
+    @property
+    def LOCAL_REASONING_MODEL(self) -> str:
+        """Local reasoning model for low-complexity reasoning tasks."""
+        return os.getenv("NADIRCLAW_LOCAL_REASONING_MODEL", "ollama/deepseek-r1:8b")
+
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Parallel dispatch settings
+    # ------------------------------------------------------------------
+
+    @property
+    def PARALLEL_DISPATCH_ENABLED(self) -> bool:
+        """Enable parallel multi-model dispatch for moderate/complex tiers."""
+        return os.getenv("NADIRCLAW_PARALLEL_DISPATCH_ENABLED", "false").lower() in ("1", "true", "yes")
+
+    @property
+    def PARALLEL_JUDGE_MODEL(self) -> str:
+        """Fast local model used to judge parallel responses."""
+        return os.getenv("NADIRCLAW_PARALLEL_JUDGE_MODEL", "") or self.TRIVIAL_MODEL
+
+    # ------------------------------------------------------------------
+
     @property
     def has_explicit_tiers(self) -> bool:
         """True if SIMPLE_MODEL and COMPLEX_MODEL are explicitly set via env."""

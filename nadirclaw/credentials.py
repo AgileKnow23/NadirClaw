@@ -38,6 +38,7 @@ _MODEL_PROVIDER_PATTERNS = {
     "anthropic/": "anthropic",
     "claude-": "anthropic",
     "openai-codex/": "openai-codex",
+    "codex/": "openai-codex",
     "openai/": "openai",
     "gpt-": "openai",
     "o1-": "openai",
@@ -252,8 +253,16 @@ def get_credential(provider: str) -> Optional[str]:
 
 
     # 2. NadirClaw stored credentials (with OAuth auto-refresh)
+    #    Check provider name and common aliases (e.g. "google" → "gemini")
+    _PROVIDER_ALIASES = {"google": ["gemini"], "gemini": ["google"]}
     creds = _read_credentials()
     entry = creds.get(provider)
+    if not entry:
+        for alias in _PROVIDER_ALIASES.get(provider, []):
+            entry = creds.get(alias)
+            if entry:
+                provider = alias  # use alias name for refresh lookup
+                break
     if entry and entry.get("token"):
         return _maybe_refresh_oauth(provider, entry)
 
@@ -312,6 +321,19 @@ def detect_provider(model: str) -> Optional[str]:
         if model.startswith(pattern):
             return provider
     return None
+
+
+def get_credential_metadata(provider: str) -> dict:
+    """Get stored metadata for a provider (project_id, email, etc)."""
+    _PROVIDER_ALIASES = {"google": ["gemini"], "gemini": ["google"]}
+    creds = _read_credentials()
+    entry = creds.get(provider, {})
+    if not entry:
+        for alias in _PROVIDER_ALIASES.get(provider, []):
+            entry = creds.get(alias, {})
+            if entry:
+                break
+    return {k: v for k, v in entry.items() if k not in ("token", "refresh_token")}
 
 
 def list_credentials() -> list[dict]:
