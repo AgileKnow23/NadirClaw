@@ -35,4 +35,4 @@ logs/
 
 # NadirClaw credentials (prevent accidental commits)
 .nadirclaw/
-credentials.json
+credentials.json.webui_secret_key
