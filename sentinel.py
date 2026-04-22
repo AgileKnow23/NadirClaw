@@ -49,12 +49,17 @@ COOLDOWN_SECONDS = 90
 MAX_RECOVERIES_PER_HOUR = 4
 
 NADIRCLAW_DIR = Path(__file__).parent
-CONFIG_FILE = Path.home() / ".nadirclaw" / ".env"
+# Sentinel runs as LocalSystem under NSSM; Path.home() resolves to
+# C:\Windows\System32\config\systemprofile which is NOT Bryan's profile.
+# Anchor user-profile paths to USER_HOME explicitly.
+USER_HOME = Path(os.environ.get("NADIRCLAW_USER_HOME", r"C:\Users\Agile"))
+CONFIG_FILE = USER_HOME / ".nadirclaw" / ".env"
 TRANSCRIBE_CONFIG = Path("C:/transcribe/config.json")  # Telegram creds
 LOG_FILE = NADIRCLAW_DIR / "sentinel.log"
 STATE_FILE = NADIRCLAW_DIR / "sentinel_state.json"
 
-AK_DASHBOARD_DIR = Path.home() / "ak_dashboard"
+AK_DASHBOARD_DIR = USER_HOME / "ak_dashboard"
+OLLAMA_EXE = USER_HOME / "AppData" / "Local" / "Programs" / "Ollama" / "ollama.exe"
 
 SERVICES = {
     "nadirclaw": {
@@ -276,11 +281,10 @@ def restart_ollama() -> bool:
         )
         time.sleep(3)
         # Relaunch
-        ollama_exe = Path.home() / "AppData" / "Local" / "Programs" / "Ollama" / "ollama.exe"
-        if not ollama_exe.exists():
-            log(f"  Ollama exe not found at {ollama_exe}")
+        if not OLLAMA_EXE.exists():
+            log(f"  Ollama exe not found at {OLLAMA_EXE}")
             return False
-        ok = start_detached(str(ollama_exe), ["serve"], cwd=str(ollama_exe.parent))
+        ok = start_detached(str(OLLAMA_EXE), ["serve"], cwd=str(OLLAMA_EXE.parent))
         if not ok:
             return False
         time.sleep(8)  # Ollama takes a few seconds to bind
