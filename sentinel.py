@@ -187,6 +187,136 @@ def check_all() -> dict[str, tuple[bool, str]]:
 
 
 # ---------------------------------------------------------------------------
+# Accountant Monthly heartbeat watcher
+# ---------------------------------------------------------------------------
+#
+# accountant_monthly.py runs on the 3rd of each month and writes a
+# heartbeat JSON. We want the package in Gueto's inbox by the 3rd, so
+# from the 4th onward we expect a recent "ok" heartbeat. A missing or
+# stale heartbeat means Bryan didn't get an email and the cron job died
+# silently — exactly the dark-period scenario we got bit by during the
+# SurrealDB namespace wipe.
+#
+# Telegram alerts are rate-limited to once per calendar day so a stuck
+# failure doesn't blast 1440 messages.
+
+ACCOUNTANT_HEARTBEAT_DIR = (
+    USER_HOME / "Documents" / "Agile Know" / "Finance"
+)
+ACCOUNTANT_ALERT_STATE_FILE = NADIRCLAW_DIR / "accountant_alert_state.json"
+ACCOUNTANT_DUE_DAY = 4  # By the 4th of each month, heartbeat must be OK
+ACCOUNTANT_STALE_HOURS = 36  # heartbeat older than this is stale
+
+
+def _heartbeat_path(year: int) -> Path:
+    return (
+        ACCOUNTANT_HEARTBEAT_DIR
+        / str(year)
+        / "Monthly Reconciliation"
+        / "Logs"
+        / "accountant_monthly_heartbeat.json"
+    )
+
+
+def check_accountant_monthly() -> tuple[bool, str]:
+    """Return (healthy, reason) for the monthly Gueto package.
+
+    Healthy when:
+      - Today is before the ACCOUNTANT_DUE_DAY of the current month
+        (cron hasn't run yet, nothing to check)
+      - OR the heartbeat exists, was written within ACCOUNTANT_STALE_HOURS,
+        and status == 'ok' (or 'dry_run_ok' for manual tests)
+    """
+    now = datetime.now()
+    if now.day < ACCOUNTANT_DUE_DAY:
+        return True, f"not due yet (day < {ACCOUNTANT_DUE_DAY})"
+
+    # Cron is supposed to run on the 3rd against the PRIOR month, so the
+    # heartbeat lands in the prior-month's year folder.
+    target_year = now.year - 1 if now.month == 1 else now.year
+    hb_path = _heartbeat_path(target_year)
+    if not hb_path.exists():
+        return False, f"heartbeat missing: {hb_path}"
+
+    try:
+        payload = json.loads(hb_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return False, f"heartbeat unreadable: {exc}"
+
+    ts_str = payload.get("ts")
+    status = payload.get("status", "")
+    detail = payload.get("detail", "")
+    try:
+        ts = datetime.fromisoformat(ts_str)
+    except Exception:
+        return False, f"heartbeat ts unparseable: {ts_str!r}"
+
+    age_hours = (now - ts).total_seconds() / 3600
+    if age_hours > ACCOUNTANT_STALE_HOURS:
+        return False, (
+            f"heartbeat stale ({age_hours:.1f}h old, status={status!r}). "
+            f"Last detail: {detail}"
+        )
+    if status not in ("ok", "dry_run_ok"):
+        return False, f"heartbeat status={status!r} ({detail})"
+    return True, f"ok ({age_hours:.1f}h ago, {status})"
+
+
+def _accountant_alert_state() -> dict:
+    if not ACCOUNTANT_ALERT_STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(ACCOUNTANT_ALERT_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_accountant_alert_state(state: dict) -> None:
+    try:
+        ACCOUNTANT_ALERT_STATE_FILE.write_text(
+            json.dumps(state, indent=2), encoding="utf-8"
+        )
+    except OSError as exc:
+        log(f"WARN: accountant alert state write failed: {exc}")
+
+
+def maybe_alert_accountant_monthly() -> None:
+    """Call once per main-loop tick. Fires telegram only on the FIRST
+    unhealthy assessment of the calendar day, then again the next day
+    if still unhealthy. Sends a one-shot 'recovered' note when the
+    state flips back to healthy."""
+    healthy, reason = check_accountant_monthly()
+    state = _accountant_alert_state()
+    today = datetime.now().strftime("%Y-%m-%d")
+    last_alert_date = state.get("last_unhealthy_alert_date")
+    last_status = state.get("last_status", "ok")
+
+    if healthy:
+        # Recovery transition
+        if last_status == "unhealthy":
+            log(f"accountant_monthly: RECOVERED ({reason})")
+            send_telegram(
+                "*Accountant Monthly*: heartbeat recovered -> green\n"
+                f"{reason}"
+            )
+        state.update({"last_status": "ok", "last_assessed": today})
+        _save_accountant_alert_state(state)
+        return
+
+    # Unhealthy
+    if last_alert_date != today:
+        log(f"accountant_monthly: UNHEALTHY -> {reason}")
+        send_telegram(
+            "*Accountant Monthly*: monthly Gueto package did NOT land.\n"
+            f"{reason}\n"
+            "Run manually:  python C:/Users/Agile/reconcile/accountant_monthly.py"
+        )
+        state["last_unhealthy_alert_date"] = today
+    state.update({"last_status": "unhealthy", "last_assessed": today})
+    _save_accountant_alert_state(state)
+
+
+# ---------------------------------------------------------------------------
 # Remediation
 # ---------------------------------------------------------------------------
 
@@ -431,6 +561,14 @@ def main() -> int:
                     )
 
             previous_all_healthy = all_healthy
+
+            # Independent check (rate-limited to once-per-day alerting):
+            # the monthly Gueto package heartbeat. Decoupled from the
+            # service polling above because the cadence is monthly.
+            try:
+                maybe_alert_accountant_monthly()
+            except Exception as exc:
+                log(f"WARN accountant_monthly check failed: {exc!r}")
 
         except Exception as exc:
             log(f"ERROR in sentinel loop: {exc!r}")
