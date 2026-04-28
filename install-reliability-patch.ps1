@@ -1,4 +1,4 @@
-# install-reliability-patch.ps1 — run ONCE in elevated PowerShell.
+# install-reliability-patch.ps1 -- run ONCE in elevated PowerShell.
 #
 # Idempotent. Re-running is safe (re-applies settings).
 #
@@ -17,7 +17,7 @@ $DashDir = "C:\Users\Agile\ak_dashboard"
 
 if (-not (Test-Path $Nssm)) { throw "NSSM not found at $Nssm" }
 if (-not (Test-Path $Node)) { throw "Node not found at $Node" }
-if (-not (Test-Path "$DashDir\node_modules\next\dist\bin\next")) { throw "Next CLI not present in $DashDir — run npm install" }
+if (-not (Test-Path "$DashDir\node_modules\next\dist\bin\next")) { throw "Next CLI not present in $DashDir, run npm install" }
 
 # 1. Free port 3000 from the bare process so the service can bind it.
 Write-Host "[1/3] Freeing port 3000..." -ForegroundColor Cyan
@@ -32,7 +32,7 @@ Start-Sleep -Seconds 2
 Write-Host "[2/3] Installing AkDashboard NSSM service..." -ForegroundColor Cyan
 $existing = Get-Service AkDashboard -ErrorAction SilentlyContinue
 if ($existing) {
-    Write-Host "  service exists — stopping for reconfigure"
+    Write-Host "  service exists, stopping for reconfigure"
     & $Nssm stop AkDashboard 2>&1 | Out-Null
     Start-Sleep -Seconds 2
 } else {
@@ -61,7 +61,7 @@ $port = Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction Silently
 if ($port) {
     Write-Host "  port 3000 owner PID: $($port.OwningProcess)" -ForegroundColor Green
 } else {
-    Write-Host "  WARNING: port 3000 not bound yet — check $DashDir\service.log" -ForegroundColor Yellow
+    Write-Host "  WARNING: port 3000 not bound yet, check $DashDir\service.log" -ForegroundColor Yellow
 }
 
 # 3. Restart NadirClawSentinel to load the patched sentinel.py
@@ -73,14 +73,14 @@ Write-Host "  NadirClawSentinel: $($sent.Status)" -ForegroundColor Green
 
 Write-Host ""
 Write-Host "Done. Sentinel will now monitor:" -ForegroundColor Green
-Write-Host "  - nadirclaw    (8856)"
-Write-Host "  - surrealdb    (8000)"
-Write-Host "  - ak_dashboard (3000)  <- now an auto-restarting NSSM service"
-Write-Host "  - ollama       (11434)"
-Write-Host "  - status_app   (8766)  <- newly monitored"
-Write-Host "  - cloudflared  (deep edge-connection check)  <- newly monitored"
+Write-Host "  [*] nadirclaw    (8856)"
+Write-Host "  [*] surrealdb    (8000)"
+Write-Host "  [*] ak_dashboard (3000)  -- now an auto-restarting NSSM service"
+Write-Host "  [*] ollama       (11434)"
+Write-Host "  [*] status_app   (8766)  -- newly monitored"
+Write-Host "  [*] cloudflared  (deep edge-connection check)  -- newly monitored"
 Write-Host ""
-Write-Host "Next time anything dies (sleep, reboot, crash, tunnel disconnect):"
+Write-Host "Next time anything dies:"
 Write-Host "  - NSSM restarts the process within seconds"
 Write-Host "  - Sentinel double-checks within 60s and restarts if still down"
 Write-Host "  - You get a Telegram notification"

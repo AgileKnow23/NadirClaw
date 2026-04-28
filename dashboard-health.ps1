@@ -12,7 +12,7 @@ function Color($txt, $fg) { Write-Host $txt -ForegroundColor $fg -NoNewline }
 function Line($txt, $fg)  { Write-Host $txt -ForegroundColor $fg }
 
 Write-Host ""
-Line "=== Bryan's Stack — Health Check ===" Cyan
+Line "=== Bryan's Stack Health Check ===" Cyan
 Write-Host ""
 
 # --- Sentinel state ---
@@ -23,7 +23,7 @@ if (Test-Path $stateFile) {
         $state = Get-Content $stateFile -Raw | ConvertFrom-Json
         $age = (Get-Date) - [datetime]$state.assessed_at
         if ($age.TotalMinutes -gt 5) {
-            Line ("Sentinel state is STALE ({0:N0}m old) — sentinel may be hung." -f $age.TotalMinutes) Yellow
+            Line ("Sentinel state is STALE ({0:N0}m old), sentinel may be hung." -f $age.TotalMinutes) Yellow
         } else {
             Line ("Sentinel last assessed {0:N0}s ago (PID {1})" -f $age.TotalSeconds, $state.sentinel_pid) DarkGray
         }
@@ -31,7 +31,7 @@ if (Test-Path $stateFile) {
         Line "Sentinel state file unreadable" Red
     }
 } else {
-    Line "Sentinel state file missing — sentinel never started?" Red
+    Line "Sentinel state file missing, sentinel never started?" Red
 }
 
 # --- Local services (from sentinel state) ---
@@ -42,7 +42,7 @@ if ($state -and $state.services) {
         $svc = $state.services.$name
         $mark = if ($svc.healthy) { "[OK]" } else { "[DOWN]" }
         $color = if ($svc.healthy) { "Green" } else { "Red" }
-        $reason = if ($svc.healthy) { "" } else { " — $($svc.reason)" }
+        $reason = if ($svc.healthy) { "" } else { "  $($svc.reason)" }
         Color ("  {0,-7}" -f $mark) $color
         Color (" {0,-15}" -f $name) White
         Line $reason DarkGray
@@ -66,7 +66,7 @@ foreach ($e in $endpoints) {
         $mark = if ($code -lt 400) { "[OK]" } else { "[$code]" }
         Color ("  {0,-7}" -f $mark) $color
         Color (" {0,-15}" -f $e.Name) White
-        Line ("HTTP {0} — {1}" -f $code, $e.Url) DarkGray
+        Line ("HTTP {0}  {1}" -f $code, $e.Url) DarkGray
     } catch {
         Color "  [DOWN] " Red
         Color (" {0,-15}" -f $e.Name) White
@@ -100,7 +100,7 @@ if ($ans -notmatch "^[Yy]") {
 Write-Host ""
 Line "Triggering Sentinel restart (this re-runs all health checks)..." Cyan
 
-# Restart NadirClawSentinel via elevated PowerShell — its main loop
+# Restart NadirClawSentinel via elevated PowerShell. Its main loop
 # will detect failures and call the appropriate restart_* function.
 Start-Process powershell -Verb RunAs -Wait -ArgumentList @(
     "-NoProfile",
