@@ -86,6 +86,22 @@ SERVICES = {
         "health_key": None,
         "health_value": None,
     },
+    "status_app": {
+        "port": 8766,
+        "health_url": "http://127.0.0.1:8766/",
+        "health_key": None,
+        "health_value": None,
+    },
+    "cloudflared": {
+        # Cloudflared's own health endpoint. /ready returns 200 ONLY when
+        # at least one tunnel connection to the edge is live; returns 503
+        # when the daemon is up but disconnected (the failure mode that
+        # produces a Cloudflare 1033 error to end users).
+        "port": 20241,
+        "health_url": "http://127.0.0.1:20241/ready",
+        "health_key": "readyConnections",
+        "health_min": 1,
+    },
 }
 
 
@@ -165,18 +181,51 @@ def _record_recovery() -> None:
 
 
 def check_service(name: str, cfg: dict) -> tuple[bool, str]:
-    """Return (healthy, reason). Tries HTTP first, falls back to port check."""
+    """Return (healthy, reason). HTTP GET with optional body checks.
+
+    Supported body checks:
+      health_key + health_value     → field must equal exact value
+      health_key + health_min       → field must be >= numeric min
+                                       (and HTTP 503 with body still
+                                       parses, since cloudflared returns
+                                       503 with readyConnections=0 when
+                                       the tunnel is degraded — we want
+                                       to read that body, not fail-open
+                                       on the status code alone).
+    """
     url = cfg["health_url"]
+    has_min = "health_min" in cfg
     try:
         req = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            if resp.status != 200:
-                return False, f"HTTP {resp.status}"
-            if cfg["health_key"]:
-                body = json.loads(resp.read().decode("utf-8"))
-                if body.get(cfg["health_key"]) != cfg["health_value"]:
-                    return False, f"{cfg['health_key']}={body.get(cfg['health_key'])!r} (expected {cfg['health_value']!r})"
-            return True, "ok"
+        try:
+            resp = urllib.request.urlopen(req, timeout=5)
+            status = resp.status
+            body_bytes = resp.read()
+        except urllib.error.HTTPError as http_err:
+            # cloudflared returns HTTP 503 with a JSON body when degraded
+            # — we want to inspect the body, not abort on the status.
+            if has_min:
+                status = http_err.code
+                body_bytes = http_err.read()
+            else:
+                raise
+        if not has_min and status != 200:
+            return False, f"HTTP {status}"
+        if cfg.get("health_key"):
+            try:
+                body = json.loads(body_bytes.decode("utf-8"))
+            except Exception:
+                return False, f"non-JSON body (HTTP {status})"
+            actual = body.get(cfg["health_key"])
+            if has_min:
+                try:
+                    if int(actual) < cfg["health_min"]:
+                        return False, f"{cfg['health_key']}={actual} < {cfg['health_min']}"
+                except (TypeError, ValueError):
+                    return False, f"{cfg['health_key']}={actual!r} not numeric"
+            elif actual != cfg.get("health_value"):
+                return False, f"{cfg['health_key']}={actual!r} (expected {cfg.get('health_value')!r})"
+        return True, "ok"
     except Exception as exc:
         return False, f"{type(exc).__name__}: {str(exc)[:100]}"
 
@@ -429,34 +478,80 @@ def restart_ollama() -> bool:
         return False
 
 
-def restart_ak_dashboard() -> bool:
-    """Restart the AK Dashboard Next.js app."""
-    log("  restarting AK Dashboard (next start)...")
+def _restart_windows_service(svc_name: str) -> bool:
+    """nssm restart <svc>. NSSM handles kill + relaunch + log rotation cleanly."""
     try:
-        # Kill existing next process on port 3000
-        subprocess.run(
-            ["taskkill", "/F", "/FI", f"WINDOWTITLE eq next*", "/IM", "node.exe"],
-            capture_output=True, timeout=10,
+        nssm = shutil.which("nssm") or "nssm"
+        res = subprocess.run(
+            [nssm, "restart", svc_name],
+            capture_output=True, text=True, timeout=30,
         )
-        time.sleep(3)
-        # Relaunch — resolve node on PATH so we don't depend on cwd
-        node_exe = shutil.which("node") or "node"
-        ok = start_detached(
-            node_exe,
-            ["node_modules/next/dist/bin/next", "start"],
-            cwd=str(AK_DASHBOARD_DIR),
-        )
+        # NSSM returns 0 on success, but its stdout is the only signal
+        # for some failure modes (e.g. service not installed).
+        ok = res.returncode == 0
         if not ok:
+            log(f"  nssm restart {svc_name} failed: rc={res.returncode} {res.stderr.strip()[:200]}")
+        return ok
+    except Exception as exc:
+        log(f"  nssm restart {svc_name} exception: {exc}")
+        return False
+
+
+def restart_ak_dashboard() -> bool:
+    """Restart the AK Dashboard via its NSSM service."""
+    log("  restarting AK Dashboard (nssm AkDashboard)...")
+    if not _restart_windows_service("AkDashboard"):
+        return False
+    # Next.js cold start: ~2s for next start to bind the socket.
+    time.sleep(8)
+    healthy, reason = check_service("ak_dashboard", SERVICES["ak_dashboard"])
+    if healthy:
+        log("  AK Dashboard restart OK")
+        return True
+    log(f"  AK Dashboard restart — still unhealthy: {reason}")
+    return False
+
+
+def restart_status_app() -> bool:
+    """Restart the transcribe StatusApp (port 8766) via its NSSM service."""
+    log("  restarting StatusApp (nssm StatusApp)...")
+    if not _restart_windows_service("StatusApp"):
+        return False
+    time.sleep(5)
+    healthy, reason = check_service("status_app", SERVICES["status_app"])
+    if healthy:
+        log("  StatusApp restart OK")
+        return True
+    log(f"  StatusApp restart — still unhealthy: {reason}")
+    return False
+
+
+def restart_cloudflared() -> bool:
+    """Restart the cloudflared tunnel daemon. Used when /ready returns
+    0 connections — process is up but disconnected from the edge,
+    causing CF 1033 errors at the public hostnames. PowerShell
+    Restart-Service requires admin; sentinel runs as LocalSystem so
+    it has the rights."""
+    log("  restarting Cloudflared (Restart-Service)...")
+    try:
+        res = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive",
+             "-Command", "Restart-Service Cloudflared -Force"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if res.returncode != 0:
+            log(f"  Restart-Service failed: {res.stderr.strip()[:200]}")
             return False
-        time.sleep(8)
-        healthy, reason = check_service("ak_dashboard", SERVICES["ak_dashboard"])
+        # Cloudflared takes a few seconds to re-establish edge connections
+        time.sleep(15)
+        healthy, reason = check_service("cloudflared", SERVICES["cloudflared"])
         if healthy:
-            log("  AK Dashboard restart OK")
+            log("  Cloudflared restart OK")
             return True
-        log(f"  AK Dashboard restart — still unhealthy: {reason}")
+        log(f"  Cloudflared restart — still unhealthy: {reason}")
         return False
     except Exception as exc:
-        log(f"  AK Dashboard restart failed: {exc}")
+        log(f"  Cloudflared restart failed: {exc}")
         return False
 
 
@@ -465,6 +560,8 @@ RESTART_FNS = {
     "surrealdb": restart_surrealdb,
     "ollama": restart_ollama,
     "ak_dashboard": restart_ak_dashboard,
+    "status_app": restart_status_app,
+    "cloudflared": restart_cloudflared,
 }
 
 
