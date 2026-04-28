@@ -2,6 +2,16 @@
 
 All notable changes to NadirClaw will be documented in this file.
 
+## [0.5.1] - 2026-04-28
+
+### Fixed
+- **NadirClaw is now its own NSSM service (`NadirClaw-Router`)**. Previously the sentinel relaunched it via `Start-Process python.exe -c "...cli.main()"` from LocalSystem context — the child crashed silently (no PATH for user-profile site-packages, stderr swallowed). The recovery budget burned 4/hr for hours, producing rate-limit Telegram alerts. Service now runs `nadirclaw.exe serve` directly with `USERPROFILE`/`HOME`/`NADIRCLAW_USER_HOME` pinned to `C:\Users\Agile`.
+- `sentinel.py:restart_nadirclaw()` now calls `_restart_windows_service("NadirClaw-Router")` instead of spawning Python — same pattern as `restart_ak_dashboard` and `restart_status_app`.
+
+### Added
+- `scripts/fix_services_admin.ps1` — idempotent recovery installer (stops :8856, removes old service, reinstalls, starts NadirClaw-Router + AkDashboard, restarts NadirClawSentinel).
+- Logs: `~/.nadirclaw/logs/NadirClaw-Router.log` and `NadirClaw-Router-error.log` (NSSM-rotated at 10 MB).
+
 ## [0.3.0] - 2025-02-14
 
 ### Added

@@ -24,7 +24,7 @@ Every always-on process is a Windows service (NSSM-managed unless noted). NSSM a
 | Service name | Port | Manager | What it is |
 |---|---|---|---|
 | `SurrealDB` | 8000 | NSSM | The database backing AK dashboard, RAAIDD, agent memory |
-| `NadirClaw` | 8856 | bare process | LLM router (started by `nadirclaw serve`) |
+| `NadirClaw-Router` | 8856 | NSSM | LLM router (`nadirclaw.exe serve`) — converted to NSSM service 2026-04-28 |
 | `Ollama` | 11434 | Windows service | Local LLM runtime |
 | `AkDashboard` | 3000 | NSSM | Next.js financial dashboard (`akdashboard.agent-buddy.ai`) |
 | `StatusApp` | 8766 | NSSM | RAAIDD "Calls" UI (`pipeline.agent-buddy.ai`) |
@@ -71,6 +71,7 @@ Note: sentinel does this automatically when `cloudflared`'s `/ready` endpoint re
 | Service | Log path |
 |---|---|
 | AkDashboard | `C:\Users\Agile\ak_dashboard\service.log` (rotated at 10 MB) |
+| NadirClaw-Router | `C:\Users\Agile\.nadirclaw\logs\NadirClaw-Router.log` + `NadirClaw-Router-error.log` (rotated at 10 MB) |
 | StatusApp | NSSM redirects per its config — `nssm get StatusApp AppStdout` |
 | AutoRecord / CoachStreamer / TranscribeWatcher | `C:\transcribe\*.log` |
 | Sentinel | `C:\Users\Agile\Respositories\NadirClaw\sentinel.log` |

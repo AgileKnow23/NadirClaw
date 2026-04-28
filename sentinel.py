@@ -399,31 +399,24 @@ def start_detached(file_path: str, args: list[str], cwd: str) -> bool:
 
 
 def restart_nadirclaw() -> bool:
-    """Start NadirClaw in the background. Returns True on apparent success."""
-    log("  restarting NadirClaw...")
-    try:
-        ok = start_detached(
-            sys.executable,
-            [
-                "-c",
-                "import sys; sys.argv=['nadirclaw','serve']; "
-                "from nadirclaw.cli import main; main()",
-            ],
-            cwd=str(NADIRCLAW_DIR),
-        )
-        if not ok:
-            return False
-        # Uvicorn + model load takes a few seconds
-        time.sleep(10)
-        healthy, reason = check_service("nadirclaw", SERVICES["nadirclaw"])
-        if healthy:
-            log("  NadirClaw restart OK")
-            return True
-        log(f"  NadirClaw restart — still unhealthy: {reason}")
+    """Restart NadirClaw via its NSSM service (NadirClaw-Router).
+
+    Spawning python.exe from LocalSystem context dies silently — the child has
+    no access to the user-profile site-packages or PATH, and Start-Process
+    swallows stderr. NSSM owns the user-mapped service so we restart it
+    instead.
+    """
+    log("  restarting NadirClaw (nssm NadirClaw-Router)...")
+    if not _restart_windows_service("NadirClaw-Router"):
         return False
-    except Exception as exc:
-        log(f"  NadirClaw restart failed: {exc}")
-        return False
+    # Uvicorn + model load takes a few seconds
+    time.sleep(10)
+    healthy, reason = check_service("nadirclaw", SERVICES["nadirclaw"])
+    if healthy:
+        log("  NadirClaw restart OK")
+        return True
+    log(f"  NadirClaw restart — still unhealthy: {reason}")
+    return False
 
 
 def restart_surrealdb() -> bool:

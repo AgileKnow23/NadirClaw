@@ -70,13 +70,23 @@ If you see a symptom on this page, the line below it is the fix. If your symptom
 ---
 
 ## "URLError: WinError 10061" in sentinel.log for nadirclaw
-**Cause**: NadirClaw (port 8856) isn't running. Sentinel tries to restart it but if `sys.executable` doesn't have `nadirclaw` installed properly the restart fails too.
-**Fix**: launch manually from a non-elevated shell:
+**Cause**: NadirClaw (port 8856) isn't running.
+**Fix** (since 2026-04-28, NadirClaw runs as NSSM service `NadirClaw-Router`):
+```powershell
+Restart-Service NadirClaw-Router         # admin shell
+# or, if rate limit is also hit:
+Restart-Service NadirClawSentinel -Force # also clears in-memory rate limiter
+```
+**If restart keeps failing**: read `C:\Users\Agile\.nadirclaw\logs\NadirClaw-Router-error.log` for the actual error (missing module, port collision, OAuth token expired). Last-resort manual launch:
 ```powershell
 cd C:\Users\Agile\Respositories\NadirClaw
-python -m nadirclaw serve
+python -c "import sys; sys.argv=['nadirclaw','serve']; from nadirclaw.cli import main; main()"
 ```
-If it complains about missing modules, `pip install -e .` first. NadirClaw's restart isn't NSSM-managed (it's a bare process), which is the next thing to harden.
+**Reinstall the service** (admin shell):
+```powershell
+& 'C:\Users\Agile\Respositories\NadirClaw\scripts\fix_services_admin.ps1'
+```
+That script is idempotent — stops anything on :8856, removes the old service, reinstalls clean.
 
 ---
 
