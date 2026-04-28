@@ -1,0 +1,25 @@
+# Run with:
+#   pip install pre-commit && pre-commit install
+# Then every `git commit` triggers these hooks. CI doesn't run this; it's a
+# developer convenience. The repo's other pre-commit hook (.git/hooks/pre-commit
+# — Codex review) keeps working alongside this.
+#
+# Bypass any single commit:  git commit --no-verify
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      # Stop us from re-committing a 1 MB hero image again.
+      - id: check-added-large-files
+        args: ["--maxkb=500"]
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        args: ["--markdown-linebreak-ext=md"]
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+        # PowerShell scripts must stay CRLF on Windows.
+        exclude: '\.ps1$|\.bat$'
