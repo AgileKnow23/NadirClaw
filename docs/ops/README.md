@@ -16,6 +16,7 @@ etc — anything in `docs/ops/` is fork-specific and operational.
 |---|---|---|
 | [HANDBOOK.md](HANDBOOK.md) | Full reference: every service, every port, every log, every command | Onboarding a new machine, planning a change, "what's running where?" |
 | [FAQ.md](FAQ.md) | Symptom → fix lookup. Cloudflare 1033, dashboard empty, sentinel hung, etc. | Something is broken right now and you want a one-line fix |
+| [BACKLOG.md](BACKLOG.md) | Prioritized work queue with effort estimates and resume triggers | Starting a new Claude session with "what should I work on?" |
 | [SESSIONS/](SESSIONS/) | Per-session change logs. Captures what shipped, why, and what's still pending | After a long session, before going to bed, to refresh memory next morning |
 
 ## Reading on your phone
