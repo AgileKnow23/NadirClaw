@@ -96,6 +96,13 @@ async def lifespan(app: FastAPI):
         interrupted = await mark_interrupted_pipelines()
         if interrupted:
             logger.info("Crash recovery: marked %d stale pipeline(s) as interrupted", interrupted)
+    # Initialize session history schema (SurrealDB action tables)
+    try:
+        from nadirclaw.history_middleware import ensure_schema
+        ensure_schema()
+        logger.info("Session history schema initialized")
+    except Exception as e:
+        logger.warning("Session history schema init failed (non-fatal): %s", e)
     yield
     if settings.SURREALDB_ENABLED:
         from nadirclaw.db import close_db
@@ -1278,6 +1285,24 @@ async def chat_completions(
         )
 
         _log_request(log_entry)
+
+        # Log to session history (SurrealDB + vector embedding) — fire and forget
+        try:
+            from nadirclaw.history_middleware import log_completion_async
+            asyncio.create_task(log_completion_async(
+                request_id=request_id,
+                messages=[{"role": m.role, "content": m.text_content()} for m in request.messages],
+                model=selected_model,
+                provider=provider,
+                tier=analysis_info.get("tier", "unknown"),
+                response_text=response_data.get("content", ""),
+                prompt_tokens=response_data["prompt_tokens"],
+                completion_tokens=response_data["completion_tokens"],
+                latency_ms=elapsed_ms,
+                stream=request.stream,
+            ))
+        except Exception:
+            pass  # Never break the main flow
 
         # Publish to event bus for real-time dashboard
         asyncio.create_task(event_bus.publish({
