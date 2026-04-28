@@ -33,25 +33,13 @@ Write-Host "[2/3] Installing AkDashboard NSSM service..." -ForegroundColor Cyan
 $existing = Get-Service AkDashboard -ErrorAction SilentlyContinue
 if ($existing) {
     Write-Host "  service exists, stopping for reconfigure"
-    & $Nssm stop AkDashboard 2>&1 | Out-Null
-    Start-Sleep -Seconds 2
+    & $Nssm stop AkDashboard    Start-Sleep -Seconds 2
 } else {
     Write-Host "  installing fresh"
-    & $Nssm install AkDashboard $Node "node_modules\next\dist\bin\next" "start" 2>&1 | Out-Null
-}
+    & $Nssm install AkDashboard $Node "node_modules\next\dist\bin\next" "start"}
 
-& $Nssm set AkDashboard AppDirectory $DashDir 2>&1 | Out-Null
-& $Nssm set AkDashboard AppStdout "$DashDir\service.log" 2>&1 | Out-Null
-& $Nssm set AkDashboard AppStderr "$DashDir\service.log" 2>&1 | Out-Null
-& $Nssm set AkDashboard AppRotateFiles 1 2>&1 | Out-Null
-& $Nssm set AkDashboard AppRotateBytes 10485760 2>&1 | Out-Null
-& $Nssm set AkDashboard AppEnvironmentExtra "NODE_ENV=production" "PORT=3000" 2>&1 | Out-Null
-& $Nssm set AkDashboard Start SERVICE_AUTO_START 2>&1 | Out-Null
-& $Nssm set AkDashboard AppExit Default Restart 2>&1 | Out-Null
-& $Nssm set AkDashboard AppRestartDelay 5000 2>&1 | Out-Null
-& $Nssm set AkDashboard AppThrottle 10000 2>&1 | Out-Null
-
-& $Nssm start AkDashboard 2>&1 | Out-Null
+& $Nssm set AkDashboard AppDirectory $DashDir& $Nssm set AkDashboard AppStdout "$DashDir\service.log"& $Nssm set AkDashboard AppStderr "$DashDir\service.log"& $Nssm set AkDashboard AppRotateFiles 1& $Nssm set AkDashboard AppRotateBytes 10485760& $Nssm set AkDashboard AppEnvironmentExtra "NODE_ENV=production" "PORT=3000"& $Nssm set AkDashboard Start SERVICE_AUTO_START& $Nssm set AkDashboard AppExit Default Restart& $Nssm set AkDashboard AppRestartDelay 5000& $Nssm set AkDashboard AppThrottle 10000
+& $Nssm start AkDashboard
 Start-Sleep -Seconds 8
 
 $svc = Get-Service AkDashboard
