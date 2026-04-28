@@ -21,7 +21,6 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from nadirclaw import __version__
@@ -148,44 +147,14 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 # Request / response models
 # ---------------------------------------------------------------------------
 
-class ChatMessage(BaseModel):
-    model_config = {"extra": "allow"}
-    role: str
-    content: Optional[Union[str, List[Any]]] = None
-
-    def text_content(self) -> str:
-        """Extract plain text from content (handles both str and multi-modal array)."""
-        if self.content is None:
-            return ""
-        if isinstance(self.content, str):
-            return self.content
-        # Multi-modal: [{"type": "text", "text": "..."}, ...]
-        parts = []
-        for item in self.content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                parts.append(item.get("text", ""))
-            elif isinstance(item, str):
-                parts.append(item)
-        return "\n".join(parts)
-
-
-class ChatCompletionRequest(BaseModel):
-    model_config = {"extra": "allow"}
-    messages: List[ChatMessage]
-    model: Optional[str] = None
-    temperature: Optional[float] = None
-    max_tokens: Optional[int] = None
-    top_p: Optional[float] = None
-    stream: Optional[bool] = False
-
-
-class ClassifyRequest(BaseModel):
-    prompt: str
-    system_message: Optional[str] = ""
-
-
-class ClassifyBatchRequest(BaseModel):
-    prompts: List[str]
+from nadirclaw.api_models import (
+    BlastPreviewRequest,
+    ChatCompletionRequest,
+    ChatMessage,
+    ClassifyBatchRequest,
+    ClassifyRequest,
+    PipelineRequest,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1580,14 +1549,6 @@ async def trigger_learning(current_user: UserSession = Depends(validate_local_au
 # /v1/pipeline — multi-model pipeline execution
 # ---------------------------------------------------------------------------
 
-class PipelineRequest(BaseModel):
-    model_config = {"extra": "allow"}
-    messages: List[ChatMessage]
-    model: Optional[str] = None
-    temperature: Optional[float] = None
-    max_tokens: Optional[int] = None
-
-
 @app.post("/v1/pipeline")
 async def pipeline_endpoint(
     request: PipelineRequest,
@@ -1819,11 +1780,6 @@ async def pipeline_by_id(
 # ---------------------------------------------------------------------------
 # /v1/blast — BLAST prompt optimization preview
 # ---------------------------------------------------------------------------
-
-class BlastPreviewRequest(BaseModel):
-    prompt: str
-    intent: Optional[str] = None
-
 
 @app.post("/v1/blast")
 async def blast_preview(

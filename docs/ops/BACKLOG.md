@@ -58,6 +58,50 @@ Drop into `~/Documents/Agile Know/Finance/{year}/Monthly Reconciliation/Source S
 
 ---
 
+## P2 — Refactor `nadirclaw/server.py` (1950 lines → ~500-600)
+
+**Why**: server.py blew past every Power-of-Ten ceiling. The file is 1950 lines, `chat_completions` alone is 534 lines (the rule says 60), and there's a 269-line block of Gemini/LiteLLM dispatch code that duplicates `dispatch.py`. Hard to navigate, harder to test, and any future contributor (or me at 11pm) is going to make a regression.
+
+A1 (Pydantic model extraction → `nadirclaw/api_models.py`) shipped 2026-04-28 PM as the first slice.
+
+### Phase A — safe extractions (~90 min total, 4 commits)
+
+| # | Commit | What moves | Lands at | Risk |
+|---|---|---|---|---|
+| A2 | `refactor: split blast endpoints into router` | Blast routes (78 lines) | `nadirclaw/routes/blast.py` (FastAPI APIRouter) | low |
+| A3 | `refactor: split pipeline endpoints into router` | Pipeline cluster (240 lines, 5 endpoints) | `nadirclaw/routes/pipeline.py` | low |
+| A4 | `refactor: extract observability + classify endpoints` | logs/events/dashboard/search/history/knowledge/classify (~170 lines) | `nadirclaw/routes/observability.py` + `nadirclaw/routes/classify.py`; `_log_request` moves to `nadirclaw/logging.py` | medium |
+| A5 | `refactor: dedupe Gemini/LiteLLM helpers with dispatch.py` | `_call_gemini`, `_call_litellm`, `_dispatch_model`, `_call_with_fallback`, `_strip_gemini_prefix`, `_get_gemini_client`, `_rate_limit_error_response` (~390 lines) | Consolidate into existing `dispatch.py`; server.py imports them | medium |
+
+**After Phase A**: server.py ≈ 850-950 lines (mostly `lifespan`, `chat_completions`, `_RateLimiter`, model registration). Still over 800 ceiling but every concern has a home.
+
+**Resume trigger**: "let's do server.py A2 + A3" (do both router extractions in one session) / "let's tackle A4" / "dedupe server.py with dispatch.py" (A5)
+
+### Phase B — `chat_completions` refactor (separate ~2hr session)
+
+**This is the hot path. 534 lines that handle: auth, validation, rate-limiting, classification, routing, parallel-dispatch, fallback, telemetry, streaming, history-logging, error responses. Splitting it without contract tests is how you ship a regression.**
+
+**Pre-work (mandatory before touching the function)**:
+- B0: Write **golden-fixture tests** capturing today's behavior. 6-8 fixtures: streaming-success, buffered-success, rate-limit-fallback, parallel-dispatch, validation-error, model-not-found, downstream-429, agentic-detection. Snapshot input → output, commit the snapshots.
+
+**Then the actual extraction (~5 commits)**:
+- B1: extract `preprocess_request()` (auth + validation + metadata) → ~80 lines out
+- B2: extract `select_route(request, analysis)` (smart_route + agentic + reasoning detection) → ~60 lines out
+- B3: extract `dispatch_with_policy(...)` (rate-limit + parallel decision + fallback) → ~120 lines out
+- B4: extract `build_response(...)` (streaming vs buffered + history log + telemetry) → ~150 lines out
+- B5: chat_completions becomes ~80 lines orchestrating those four
+
+**After Phase B**: server.py ≈ 500-600 lines, under the ceiling. Each helper testable in isolation.
+
+**Risks I'm not waving away**:
+1. `chat_completions` reads as one continuous flow with shared state (`request_id`, `analysis_info`, `selected_model`, `provider`, `start_time`). Naïve extraction explodes the parameter list. The right boundary is probably a `RequestContext` dataclass.
+2. A5 (dedupe with dispatch.py) needs careful side-by-side diff — the two implementations may have drifted.
+3. `pytest --cov=nadirclaw.server` should run BEFORE any Phase B work, so we know what's actually exercised.
+
+**Resume trigger**: "let's do the chat_completions refactor — start with B0 golden fixtures"
+
+---
+
 ## P3 — Nice-to-haves
 
 ### P3-1. April 2026 statements (~5 min, after May 5-15)
