@@ -1,8 +1,8 @@
 # NadirClaw
-<img alt="NadirClaw" src="logo_rb.png" />
+<img alt="NadirClaw" src="docs/images/logo_rb.png" />
 
 [![PyPI](https://img.shields.io/pypi/v/nadirclaw)](https://pypi.org/project/nadirclaw/)
-[![CI](https://github.com/doramirdor/NadirClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/doramirdor/NadirClaw/actions)
+[![CI](https://github.com/AgileKnow23/NadirClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/AgileKnow23/NadirClaw/actions)
 [![Python](https://img.shields.io/pypi/pyversions/nadirclaw)](https://pypi.org/project/nadirclaw/)
 [![License](https://img.shields.io/github/license/doramirdor/NadirClaw)](LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/doramirdor/NadirClaw?style=social)](https://github.com/doramirdor/NadirClaw)
