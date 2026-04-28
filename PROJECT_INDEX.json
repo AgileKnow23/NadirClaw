@@ -1,0 +1,150 @@
+{
+  "project": "NadirClaw",
+  "version": "0.5.0",
+  "changelog_unreleased": "0.5.1",
+  "fork": "AgileKnow23/NadirClaw",
+  "upstream": "doramirdor/NadirClaw",
+  "generated": "2026-04-28T13:30:00-04:00",
+  "purpose": "Open-source LLM router that classifies prompts and routes simple ones to free/local models, complex ones to premium models via an OpenAI-compatible API.",
+  "languages": ["Python"],
+  "python_versions": ["3.10", "3.11", "3.12"],
+  "license": "MIT",
+  "entry_points": {
+    "cli": {
+      "command": "nadirclaw",
+      "module": "nadirclaw.cli:main",
+      "subcommands": ["serve", "setup", "auth", "classify", "status", "build-centroids", "service"]
+    },
+    "http_api": {
+      "module": "nadirclaw.server",
+      "port": 8856,
+      "openai_compatible": true,
+      "endpoints": ["/v1/chat/completions", "/v1/models", "/classify", "/health"]
+    },
+    "watchdog": {
+      "script": "sentinel.py",
+      "service": "NadirClawSentinel",
+      "manager": "NSSM"
+    }
+  },
+  "core_modules": {
+    "nadirclaw/cli.py": "CLI dispatcher",
+    "nadirclaw/server.py": "FastAPI application + request models",
+    "nadirclaw/dispatch.py": "Provider call layer (Gemini cloudcode, LiteLLM, Claude/Codex CLI)",
+    "nadirclaw/routing.py": "Model resolution, alias, agentic/reasoning detection, cost",
+    "nadirclaw/classifier.py": "Binary complexity classifier (sentence-transformers)",
+    "nadirclaw/classifier_v2.py": "Next-gen intent-aware classifier",
+    "nadirclaw/intent.py": "Intent detection",
+    "nadirclaw/orchestrator.py": "Multi-step orchestration",
+    "nadirclaw/parallel_dispatch.py": "Parallel-model fan-out",
+    "nadirclaw/blast.py": "Broadcast one prompt to many models",
+    "nadirclaw/pipeline.py": "Pipeline coordination",
+    "nadirclaw/pipeline_db.py": "Pipeline persistence (SurrealDB)",
+    "nadirclaw/pipeline_tracker.py": "Pipeline event tracker",
+    "nadirclaw/credentials.py": "Credential store, provider-alias resolution",
+    "nadirclaw/oauth.py": "OAuth PKCE flows (Gemini, OpenAI, Anthropic, Antigravity)",
+    "nadirclaw/auth.py": "Auth helpers / setup wizard glue",
+    "nadirclaw/settings.py": "~/.nadirclaw/.env loader",
+    "nadirclaw/service_manager.py": "NSSM service helpers (CLI: nadirclaw service ...)",
+    "nadirclaw/history_middleware.py": "Request/response logging middleware",
+    "nadirclaw/role_registry.py": "Agent role config",
+    "nadirclaw/encoder.py": "Sentence encoder wrapper",
+    "nadirclaw/prototypes.py": "Centroid prototypes for classifier",
+    "nadirclaw/knowledge.py": "Knowledge base helpers",
+    "nadirclaw/events.py": "Event bus",
+    "nadirclaw/db.py": "DB connection helpers",
+    "nadirclaw/report.py": "Report rendering",
+    "nadirclaw/setup.py": "Setup wizard",
+    "nadirclaw/telemetry.py": "Telemetry sender (optional)"
+  },
+  "openwebui_plugins": {
+    "filters": [
+      "openwebui/nadirclaw_routing_filter.py",
+      "openwebui/nadirclaw_pipeline_filter.py",
+      "openwebui/nadirclaw_blast_filter.py"
+    ],
+    "actions": [
+      "openwebui/nadirclaw_dashboard_action.py",
+      "openwebui/nadirclaw_analytics_action.py",
+      "openwebui/nadirclaw_pipeline_replay_action.py",
+      "openwebui/nadirclaw_pipeline_progress_action.py",
+      "openwebui/export_chat_action.py"
+    ]
+  },
+  "scripts": {
+    "scripts/fix_services_admin.ps1": "Idempotent NSSM recovery installer (admin). Stops :8856, removes stale service, reinstalls NadirClaw-Router, starts AkDashboard, restarts NadirClawSentinel. Added 2026-04-28.",
+    "scripts/windows_service.ps1": "Original full-stack NSSM installer (admin). Installs NadirClaw-SurrealDB + NadirClaw-Router. Use only on a fresh machine.",
+    "scripts/codex-review.sh": "Codex CLI review helper",
+    "dashboard-health.ps1": "Desktop status checker (root-level)",
+    "install-reliability-patch.ps1": "AkDashboard NSSM installer + sentinel monitors"
+  },
+  "operational_services": {
+    "NadirClaw-Router": {"port": 8856, "manager": "NSSM", "since": "2026-04-28", "exe": "C:\\Users\\Agile\\AppData\\Local\\Programs\\Python\\Python312\\Scripts\\nadirclaw.exe", "args": "serve", "log": "~/.nadirclaw/logs/NadirClaw-Router.log"},
+    "NadirClawSentinel": {"manager": "NSSM", "context": "LocalSystem", "log": "~/Respositories/NadirClaw/sentinel.log"},
+    "SurrealDB": {"port": 8000, "manager": "NSSM", "data": "~/.nadirclaw/surrealdb-data"},
+    "Ollama": {"port": 11434, "manager": "Windows service"},
+    "AkDashboard": {"port": 3000, "manager": "NSSM", "log": "~/ak_dashboard/service.log"},
+    "StatusApp": {"port": 8766, "manager": "NSSM"},
+    "Cloudflared": {"metrics_port": 20241, "manager": "Windows service"}
+  },
+  "tests": {
+    "framework": "pytest",
+    "count": 15,
+    "files": [
+      "tests/test_blast.py",
+      "tests/test_classifier.py",
+      "tests/test_credentials.py",
+      "tests/test_intent.py",
+      "tests/test_oauth.py",
+      "tests/test_pipeline.py",
+      "tests/test_pipeline_db.py",
+      "tests/test_pipeline_tracker.py",
+      "tests/test_report.py",
+      "tests/test_routing.py",
+      "tests/test_server.py",
+      "tests/test_service_manager.py",
+      "tests/test_setup.py",
+      "tests/test_telemetry.py"
+    ],
+    "run": "pytest -q",
+    "ci": ".github/workflows/ci.yml"
+  },
+  "documentation": {
+    "README.md": "Upstream OSS overview (install, providers, OAuth)",
+    "CHANGELOG.md": "Version history (0.5.1 → NSSM-ification 2026-04-28)",
+    "CONTRIBUTING.md": "Contribution guide",
+    "CODEX_CONSTITUTION.md": "Engineering law",
+    "docs/comparison.md": "NadirClaw vs OpenRouter",
+    "docs/ops/README.md": "Ops landing page",
+    "docs/ops/HANDBOOK.md": "Service map, ports, logs, restart commands, SurrealDB",
+    "docs/ops/FAQ.md": "Symptom-to-fix lookup",
+    "docs/ops/BACKLOG.md": "Prioritized work queue with resume triggers",
+    "docs/ops/SESSIONS/2026-04-28.md": "AM session: reliability patch + bank-statement filter",
+    "docs/ops/SESSIONS/2026-04-28-pm-nadirclaw-nssm.md": "PM session: NadirClaw NSSM-ification",
+    "docs/governance/": "AI governance docs (Constitution, Operating Model, Prompt Templates, AI Rules)"
+  },
+  "config_files": {
+    "pyproject.toml": "Build + deps + entry points",
+    "~/.nadirclaw/.env": "Runtime config (model tiers, ports)",
+    "~/.nadirclaw/credentials.json": "OAuth tokens",
+    "sentinel_state.json": "Sentinel poll snapshot (60s cadence)",
+    "accountant_alert_state.json": "Monthly Gueto-package heartbeat alert state"
+  },
+  "dependencies_main": [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.20.0",
+    "litellm>=1.0.0",
+    "sentence-transformers>=2.0.0",
+    "numpy",
+    "python-dotenv",
+    "httpx",
+    "pydantic"
+  ],
+  "session_resume_triggers": {
+    "general": "pull up the NadirClaw status",
+    "fix_nadirclaw_down": "NadirClaw is down again",
+    "commit_nssm_work": "commit the NadirClaw NSSM work",
+    "hostinger_migration": "I provisioned the Hostinger VPS, IP is X.X.X.X"
+  },
+  "memory_pointer": "~/.claude/projects/C--Users-Agile/memory/project_nadirclaw_sentinel.md"
+}
