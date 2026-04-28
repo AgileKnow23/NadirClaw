@@ -35,4 +35,15 @@ logs/
 
 # NadirClaw credentials (prevent accidental commits)
 .nadirclaw/
-credentials.json.webui_secret_key
+credentials.json
+
+# OpenWebUI auto-generated session secret
+.webui_secret_key
+
+# Sentinel runtime state (regenerated every 60s poll)
+sentinel_state.json
+accountant_alert_state.json
+
+# Local recovery / manual-launch logs
+fix_services_admin.log
+nadirclaw_manual.log
