@@ -50,7 +50,11 @@ class TestClassifyEndpoint:
         assert resp.status_code == 200
         data = resp.json()
         assert "classification" in data
-        assert data["classification"]["tier"] in ("simple", "complex")
+        # classifier_v2 now uses 5 tiers (trivial, simple, moderate, complex, expert);
+        # the legacy binary classifier uses just (simple, complex). Accept either.
+        assert data["classification"]["tier"] in (
+            "trivial", "simple", "moderate", "complex", "expert",
+        )
         assert "confidence" in data["classification"]
         assert "selected_model" in data["classification"]
 

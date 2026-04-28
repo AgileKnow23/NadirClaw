@@ -54,8 +54,10 @@ class TestServiceConfigs:
     def test_surrealdb_data_dir_uses_forward_slashes(self):
         configs = get_service_configs()
         args = configs["NadirClaw-SurrealDB"]["args"]
-        # The file:// URI should use forward slashes
-        assert "file://" in args
+        # SurrealDB v2+ uses rocksdb:// (replaces the legacy file:// URI).
+        # Path must use forward slashes regardless of platform.
+        assert "rocksdb://" in args
+        assert "\\" not in args.split("rocksdb://", 1)[1].split(" ", 1)[0]
 
 
 class TestNSSMCommandGeneration:
