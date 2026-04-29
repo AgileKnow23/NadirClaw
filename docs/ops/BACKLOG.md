@@ -58,24 +58,28 @@ Drop into `~/Documents/Agile Know/Finance/{year}/Monthly Reconciliation/Source S
 
 ---
 
-## P2 — Refactor `nadirclaw/server.py` (1950 lines → ~500-600)
+## P2 — Refactor `nadirclaw/server.py` (1950 → 964 → ~500-600)
 
-**Why**: server.py blew past every Power-of-Ten ceiling. The file is 1950 lines, `chat_completions` alone is 534 lines (the rule says 60), and there's a 269-line block of Gemini/LiteLLM dispatch code that duplicates `dispatch.py`. Hard to navigate, harder to test, and any future contributor (or me at 11pm) is going to make a regression.
+**Why**: server.py blew past every Power-of-Ten ceiling. The file was 1950 lines, `chat_completions` alone is 534 lines (the rule says 60), and there's a 269-line block of Gemini/LiteLLM dispatch code that duplicates `dispatch.py`. Hard to navigate, harder to test, and any future contributor (or me at 11pm) is going to make a regression.
 
-A1 (Pydantic model extraction → `nadirclaw/api_models.py`) shipped 2026-04-28 PM as the first slice.
+### Phase A — safe extractions
 
-### Phase A — safe extractions (~90 min total, 4 commits)
-
-| # | Commit | What moves | Lands at | Risk |
+| # | Commit | What moved | Landed at | Status |
 |---|---|---|---|---|
-| A2 | `refactor: split blast endpoints into router` | Blast routes (78 lines) | `nadirclaw/routes/blast.py` (FastAPI APIRouter) | low |
-| A3 | `refactor: split pipeline endpoints into router` | Pipeline cluster (240 lines, 5 endpoints) | `nadirclaw/routes/pipeline.py` | low |
-| A4 | `refactor: extract observability + classify endpoints` | logs/events/dashboard/search/history/knowledge/classify (~170 lines) | `nadirclaw/routes/observability.py` + `nadirclaw/routes/classify.py`; `_log_request` moves to `nadirclaw/logging.py` | medium |
-| A5 | `refactor: dedupe Gemini/LiteLLM helpers with dispatch.py` | `_call_gemini`, `_call_litellm`, `_dispatch_model`, `_call_with_fallback`, `_strip_gemini_prefix`, `_get_gemini_client`, `_rate_limit_error_response` (~390 lines) | Consolidate into existing `dispatch.py`; server.py imports them | medium |
+| A1 | `31411fa` refactor(server): extract Pydantic request models | 6 BaseModel classes (47 lines) | `nadirclaw/api_models.py` (64 lines) | **DONE** 2026-04-28 |
+| A2 | `6b1d5b2` refactor(server): extract blast endpoint | 1 endpoint (51 lines) | `nadirclaw/routes/blast.py` (61 lines) | **DONE** 2026-04-28 |
+| A3 | `9c589e4` refactor(server): extract pipeline endpoints | 5 endpoints (230 lines) | `nadirclaw/routes/pipeline.py` (251 lines) | **DONE** 2026-04-28 |
+| A4a | `e5456dc` refactor(server): extract log_request | `_log_request` (40 lines) + module Lock | `nadirclaw/logging.py` (56 lines) | **DONE** 2026-04-29 |
+| A4b | `bc14401` refactor(server): move smart_route helpers | `_smart_route_analysis` + `_smart_route_full` (~70 lines) | promoted to public `smart_route_analysis` / `smart_route_full` in `nadirclaw/routing.py` | **DONE** 2026-04-29 |
+| A4c | `efd6407` refactor(server): extract classify endpoints | `/v1/classify` + `/v1/classify/batch` (49 lines, 2 endpoints) | `nadirclaw/routes/classify.py` (68 lines) | **DONE** 2026-04-29 |
+| A4d | `d3d223c` refactor(server): extract observability endpoints | logs / events / dashboard / search / history / knowledge×2 / analytics (8 endpoints, 154 lines) | `nadirclaw/routes/observability.py` (175 lines) | **DONE** 2026-04-29 |
+| A5 | `5f36d15` refactor: dedupe Gemini/LiteLLM helpers with dispatch.py | `_call_gemini`, `_call_litellm`, `_dispatch_model`, `_call_with_fallback`, `_strip_gemini_prefix`, `_get_gemini_client`, `_rate_limit_error_response` (~410 lines) | Consolidated into `dispatch.py`; server uses new `call_with_tier_fallback` | **DONE** 2026-04-29 |
 
-**After Phase A**: server.py ≈ 850-950 lines (mostly `lifespan`, `chat_completions`, `_RateLimiter`, model registration). Still over 800 ceiling but every concern has a home.
+**Progress**: server.py 1950 → 964 (−986 lines, −51%). 306 tests green throughout, zero regressions.
 
-**Resume trigger**: "let's do server.py A2 + A3" (do both router extractions in one session) / "let's tackle A4" / "dedupe server.py with dispatch.py" (A5)
+**Phase A landed**. server.py ≈ 964 lines now (mostly `lifespan`, `chat_completions` + force-model branch, `_RateLimiter`, app factory, `_build_streaming_response`, `/v1/models` + `/health` + `/`). Slightly over the 800 ceiling — Phase B will cut the rest.
+
+**Resume trigger**: "let's start the chat_completions refactor — write B0 golden fixtures first" (Phase B).
 
 ### Phase B — `chat_completions` refactor (separate ~2hr session)
 
