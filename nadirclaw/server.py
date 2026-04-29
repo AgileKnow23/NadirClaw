@@ -124,9 +124,11 @@ app.add_middleware(
 # Mount feature-coherent route modules (extracted from this file).
 from nadirclaw.routes import blast as _blast_routes  # noqa: E402
 from nadirclaw.routes import classify as _classify_routes  # noqa: E402
+from nadirclaw.routes import observability as _observability_routes  # noqa: E402
 from nadirclaw.routes import pipeline as _pipeline_routes  # noqa: E402
 app.include_router(_blast_routes.router)
 app.include_router(_classify_routes.router)
+app.include_router(_observability_routes.router)
 app.include_router(_pipeline_routes.router)
 
 
@@ -1272,160 +1274,6 @@ def _build_streaming_response(
         yield {"data": "[DONE]"}
 
     return EventSourceResponse(event_generator(), media_type="text/event-stream")
-
-
-# ---------------------------------------------------------------------------
-# /v1/logs — view request logs
-# ---------------------------------------------------------------------------
-
-@app.get("/v1/logs")
-async def view_logs(
-    limit: int = 20,
-    current_user: UserSession = Depends(validate_local_auth),
-) -> Dict[str, Any]:
-    """View recent request logs."""
-    request_log = settings.LOG_DIR / "requests.jsonl"
-    if not request_log.exists():
-        return {"logs": [], "total": 0}
-
-    lines = request_log.read_text().strip().split("\n")
-    recent = lines[-limit:] if len(lines) > limit else lines
-    logs = []
-    for line in reversed(recent):
-        try:
-            logs.append(json.loads(line))
-        except json.JSONDecodeError:
-            pass
-
-    return {"logs": logs, "total": len(lines), "showing": len(logs)}
-
-
-# ---------------------------------------------------------------------------
-# /v1/events/stream — real-time SSE stream of routing events
-# ---------------------------------------------------------------------------
-
-@app.get("/v1/events/stream")
-async def event_stream(current_user: UserSession = Depends(validate_local_auth)):
-    """Real-time SSE stream of routing events."""
-    queue = event_bus.subscribe()
-
-    async def generator():
-        try:
-            while True:
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=30)
-                    yield {"data": json.dumps(event, default=str)}
-                except asyncio.TimeoutError:
-                    yield {"data": json.dumps({"event_type": "heartbeat"})}
-        except asyncio.CancelledError:
-            pass
-        finally:
-            event_bus.unsubscribe(queue)
-
-    return EventSourceResponse(generator(), media_type="text/event-stream")
-
-
-# ---------------------------------------------------------------------------
-# /v1/dashboard — snapshot report with aggregated metrics
-# ---------------------------------------------------------------------------
-
-@app.get("/v1/dashboard")
-async def dashboard(
-    limit: int = 100,
-    current_user: UserSession = Depends(validate_local_auth),
-):
-    """Dashboard snapshot: aggregated metrics + recent events."""
-    from nadirclaw.report import load_log_entries, generate_report
-
-    entries = load_log_entries(settings.LOG_DIR / "requests.jsonl")
-    report = generate_report(entries[-limit:]) if entries else {}
-    recent_events = event_bus.get_history(20)
-
-    return {
-        "report": report,
-        "recent_events": recent_events,
-        "models": {
-            "simple": settings.SIMPLE_MODEL,
-            "complex": settings.COMPLEX_MODEL,
-            "reasoning": settings.REASONING_MODEL,
-        },
-    }
-
-
-# ---------------------------------------------------------------------------
-# /v1/search — full-text search via SurrealDB
-# ---------------------------------------------------------------------------
-
-@app.get("/v1/search")
-async def search_history(
-    q: str,
-    limit: int = 20,
-    current_user: UserSession = Depends(validate_local_auth),
-):
-    """Full-text search across all routing history."""
-    from nadirclaw.db import search_requests, is_connected
-    if not is_connected():
-        raise HTTPException(503, "SurrealDB not connected")
-    results = await search_requests(q, limit=limit)
-    return {"query": q, "results": results, "count": len(results)}
-
-
-# ---------------------------------------------------------------------------
-# /v1/history — filtered conversation history via SurrealDB
-# ---------------------------------------------------------------------------
-
-@app.get("/v1/history")
-async def request_history(
-    since: str = None,
-    model: str = None,
-    tier: str = None,
-    limit: int = 50,
-    current_user: UserSession = Depends(validate_local_auth),
-):
-    """Query request history from SurrealDB with filters."""
-    from nadirclaw.db import get_requests, is_connected
-    if not is_connected():
-        raise HTTPException(503, "SurrealDB not connected")
-    results = await get_requests(since=since, model=model, tier=tier, limit=limit)
-    return {"results": results, "count": len(results)}
-
-
-# ---------------------------------------------------------------------------
-# /v1/knowledge — continuous learning endpoints
-# ---------------------------------------------------------------------------
-
-@app.get("/v1/knowledge")
-async def get_knowledge(current_user: UserSession = Depends(validate_local_auth)):
-    """Return current knowledge files content."""
-    from nadirclaw.knowledge import get_all_knowledge
-    return get_all_knowledge()
-
-
-@app.post("/v1/knowledge/learn")
-async def trigger_learning(current_user: UserSession = Depends(validate_local_auth)):
-    """Analyze recent logs and update knowledge files."""
-    from nadirclaw.knowledge import learn_from_logs
-    result = learn_from_logs(settings.LOG_DIR / "requests.jsonl")
-    return result
-
-
-# ---------------------------------------------------------------------------
-# /v1/analytics — comprehensive analytics from SurrealDB
-# ---------------------------------------------------------------------------
-
-@app.get("/v1/analytics")
-async def analytics_endpoint(
-    since: Optional[str] = "30d",
-    current_user: UserSession = Depends(validate_local_auth),
-):
-    """Aggregated analytics from SurrealDB: totals, per-model, latency, strategy, pipeline health."""
-    from nadirclaw.db import get_analytics, is_connected
-
-    if not is_connected():
-        raise HTTPException(503, "SurrealDB not connected")
-
-    data = await get_analytics(since)
-    return {"since": since, "analytics": data}
 
 
 # ---------------------------------------------------------------------------
