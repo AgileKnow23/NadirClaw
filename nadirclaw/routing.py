@@ -526,3 +526,73 @@ def apply_routing_modifiers(
     routing_info["final_model"] = final_model
     routing_info["final_tier"] = final_tier
     return final_model, final_tier, routing_info
+
+
+# ---------------------------------------------------------------------------
+# Smart-route analysis (classifier + multi-tier model selection)
+# ---------------------------------------------------------------------------
+
+async def smart_route_analysis(
+    prompt: str,
+    system_message: str,
+    user: Any = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """Run the binary classifier + classifier_v2 multi-tier picker.
+
+    Returns ``(selected_model, analysis_dict)``. Performs no LLM call.
+    Lifted from ``server.py`` during the A4 refactor so route modules can
+    import it without circular dependencies.
+    """
+    from nadirclaw.classifier import get_binary_classifier
+    from nadirclaw.classifier_v2 import classify_v2
+    from nadirclaw.settings import settings
+    from nadirclaw.telemetry import trace_span
+
+    with trace_span("smart_route_analysis") as span:
+        analyzer = get_binary_classifier()
+        result = await analyzer.analyze(text=prompt, system_message=system_message)
+
+        complexity_score = result.get("complexity_score", 0.5)
+        clf2 = classify_v2(prompt, complexity_score)
+        selected = clf2.routed_model
+
+        analysis: Dict[str, Any] = {
+            "strategy": "smart-routing",
+            "analyzer": result.get("analyzer_type", "binary"),
+            "selected_model": selected,
+            "complexity_score": complexity_score,
+            "tier": clf2.tier,
+            "task_type": clf2.task_type,
+            "v2_tier": clf2.tier,
+            "confidence": result.get("confidence"),
+            "reasoning": result.get("reasoning"),
+            "classifier_latency_ms": result.get("analyzer_latency_ms"),
+            "simple_model": settings.SIMPLE_MODEL,
+            "complex_model": settings.COMPLEX_MODEL,
+            "ranked_models": [
+                {"model": m.get("model_name"), "score": m.get("suitability_score")}
+                for m in result.get("ranked_models", [])[:5]
+            ],
+        }
+
+        if span:
+            span.set_attribute("nadirclaw.tier", analysis["tier"] or "")
+            span.set_attribute("nadirclaw.selected_model", selected)
+
+    return selected, analysis
+
+
+async def smart_route_full(messages: List[Any], user: Any = None) -> Tuple[str, Dict[str, Any]]:
+    """Smart-route over a full ChatMessage list — picks the latest user prompt.
+
+    ``messages`` is typed loosely (``List[Any]``) so this module stays free
+    of a Pydantic dependency. Each item must expose ``role`` and a
+    ``text_content()`` method, matching ``api_models.ChatMessage``.
+    """
+    user_msgs = [m.text_content() for m in messages if m.role == "user"]
+    prompt = user_msgs[-1] if user_msgs else ""
+    system_msg = next(
+        (m.text_content() for m in messages if m.role in ("system", "developer")),
+        "",
+    )
+    return await smart_route_analysis(prompt, system_msg, user)

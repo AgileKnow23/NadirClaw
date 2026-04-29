@@ -280,61 +280,11 @@ async def _periodic_state_cleanup():
 
 
 # ---------------------------------------------------------------------------
-# Smart routing internals
+# Smart routing internals (re-exported from routing.py)
 # ---------------------------------------------------------------------------
 
-async def _smart_route_analysis(
-    prompt: str, system_message: str, user: UserSession
-) -> tuple:
-    """Run classifier, return (selected_model, analysis_dict). No LLM call."""
-    from nadirclaw.classifier import get_binary_classifier
-    from nadirclaw.telemetry import trace_span
-
-    with trace_span("smart_route_analysis") as span:
-        analyzer = get_binary_classifier()
-        result = await analyzer.analyze(text=prompt, system_message=system_message)
-
-        is_complex = result.get("tier_name") == "complex"
-
-        # Use classifier_v2 for multi-tier model selection
-        complexity_score = result.get("complexity_score", 0.5)
-        clf2 = classify_v2(prompt, complexity_score)
-        selected = clf2.routed_model
-
-        analysis = {
-            "strategy": "smart-routing",
-            "analyzer": result.get("analyzer_type", "binary"),
-            "selected_model": selected,
-            "complexity_score": complexity_score,
-            "tier": clf2.tier,
-            "task_type": clf2.task_type,
-            "v2_tier": clf2.tier,
-            "confidence": result.get("confidence"),
-            "reasoning": result.get("reasoning"),
-            "classifier_latency_ms": result.get("analyzer_latency_ms"),
-            "simple_model": settings.SIMPLE_MODEL,
-            "complex_model": settings.COMPLEX_MODEL,
-            "ranked_models": [
-                {"model": m.get("model_name"), "score": m.get("suitability_score")}
-                for m in result.get("ranked_models", [])[:5]
-            ],
-        }
-
-        if span:
-            span.set_attribute("nadirclaw.tier", analysis["tier"] or "")
-            span.set_attribute("nadirclaw.selected_model", selected)
-
-    return selected, analysis
-
-
-async def _smart_route_full(
-    messages: List[ChatMessage], user: UserSession
-) -> tuple:
-    """Smart route for full completions."""
-    user_msgs = [m.text_content() for m in messages if m.role == "user"]
-    prompt = user_msgs[-1] if user_msgs else ""
-    system_msg = next((m.text_content() for m in messages if m.role in ("system", "developer")), "")
-    return await _smart_route_analysis(prompt, system_msg, user)
+from nadirclaw.routing import smart_route_analysis as _smart_route_analysis  # noqa: E402
+from nadirclaw.routing import smart_route_full as _smart_route_full  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
