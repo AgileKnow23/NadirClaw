@@ -12,7 +12,6 @@ import logging
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
 from threading import Lock
 from typing import Any, Dict, List, Optional, Union
 
@@ -166,40 +165,7 @@ from nadirclaw.api_models import (
 # Logging helper
 # ---------------------------------------------------------------------------
 
-_log_lock = Lock()
-
-
-def _log_request(entry: Dict[str, Any]) -> None:
-    """Append a JSON line to the request log and print to console."""
-    log_dir = settings.LOG_DIR
-    log_dir.mkdir(parents=True, exist_ok=True)
-    request_log = log_dir / "requests.jsonl"
-
-    entry["timestamp"] = datetime.now(timezone.utc).isoformat()
-    line = json.dumps(entry, default=str) + "\n"
-    with _log_lock:
-        with open(request_log, "a") as f:
-            f.write(line)
-
-    # Async SurrealDB write (fire-and-forget)
-    if settings.SURREALDB_ENABLED:
-        try:
-            from nadirclaw.db import insert_request
-            asyncio.get_event_loop().create_task(insert_request(entry))
-        except Exception:
-            pass  # DB failure should never block requests
-
-    tier = entry.get("tier", "?")
-    model = entry.get("selected_model", "?")
-    conf = entry.get("confidence", 0)
-    score = entry.get("complexity_score", 0)
-    prompt_preview = entry.get("prompt", "")[:80]
-    latency = entry.get("classifier_latency_ms", "?")
-    total = entry.get("total_latency_ms", "?")
-    logger.info(
-        "%-8s model=%-35s conf=%.3f score=%.2f lat=%sms total=%sms  \"%s\"",
-        tier, model, conf, score, latency, total, prompt_preview,
-    )
+from nadirclaw.logging import log_request  # noqa: E402  (re-export for callers)
 
 
 def _extract_request_metadata(request: ChatCompletionRequest) -> Dict[str, Any]:
@@ -385,7 +351,7 @@ async def classify_prompt(
         request.prompt, request.system_message or "", current_user
     )
 
-    _log_request({
+    log_request({
         "type": "classify",
         "prompt": request.prompt,
         **analysis,
@@ -413,7 +379,7 @@ async def classify_batch(
             "confidence": analysis.get("confidence"),
             "complexity_score": analysis.get("complexity_score"),
         })
-        _log_request({"type": "classify_batch", "prompt": prompt, **analysis})
+        log_request({"type": "classify_batch", "prompt": prompt, **analysis})
 
     simple_count = sum(1 for r in results if r["tier"] == "simple")
     complex_count = sum(1 for r in results if r["tier"] == "complex")
@@ -1050,7 +1016,7 @@ async def chat_completions(
                 combined_content = format_parallel_response(pd_result)
                 elapsed_ms = int((time.time() - start_time) * 1000)
 
-                _log_request({
+                log_request({
                     "type": "completion",
                     "request_id": request_id,
                     "prompt": prompt_text,
@@ -1132,7 +1098,7 @@ async def chat_completions(
                         privacy_required=clf2.privacy_required,
                     )
                     elapsed_ms = int((time.time() - start_time) * 1000)
-                    _log_request({
+                    log_request({
                         "type": "completion",
                         "request_id": request_id,
                         "prompt": prompt_text,
@@ -1258,7 +1224,7 @@ async def chat_completions(
             (m.text_content() for m in request.messages if m.role == "system"), ""
         )
 
-        _log_request(log_entry)
+        log_request(log_entry)
 
         # Log to session history (SurrealDB + vector embedding) — fire and forget
         try:
@@ -1341,7 +1307,7 @@ async def chat_completions(
     except Exception as e:
         elapsed_ms = int((time.time() - start_time) * 1000)
         logger.error("Completion error: %s", e, exc_info=True)
-        _log_request({
+        log_request({
             "type": "completion",
             "request_id": request_id,
             "status": "error",

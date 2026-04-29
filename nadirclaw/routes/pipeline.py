@@ -41,8 +41,9 @@ async def pipeline_endpoint(
     For simple queries, falls back to the standard chat completions endpoint.
     Returns OpenAI-compatible response with nadirclaw_metadata.pipeline.
     """
-    # Lazy server-module imports to avoid circular dependency on app load.
-    from nadirclaw.server import _log_request, _rate_limiter, chat_completions
+    # Lazy server-module import to avoid circular dependency on app load.
+    from nadirclaw.logging import log_request
+    from nadirclaw.server import _rate_limiter, chat_completions
 
     if not settings.PIPELINE_ENABLED:
         raise HTTPException(400, "Pipeline is disabled. Set NADIRCLAW_PIPELINE_ENABLED=true.")
@@ -130,7 +131,7 @@ async def pipeline_endpoint(
         total_prompt = sum(s.prompt_tokens for s in pipeline_result.steps)
         total_completion = sum(s.completion_tokens for s in pipeline_result.steps)
 
-        _log_request({
+        log_request({
             "type": "pipeline",
             "request_id": request_id,
             "prompt": prompt_text,
