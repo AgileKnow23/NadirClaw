@@ -123,8 +123,10 @@ app.add_middleware(
 
 # Mount feature-coherent route modules (extracted from this file).
 from nadirclaw.routes import blast as _blast_routes  # noqa: E402
+from nadirclaw.routes import classify as _classify_routes  # noqa: E402
 from nadirclaw.routes import pipeline as _pipeline_routes  # noqa: E402
 app.include_router(_blast_routes.router)
+app.include_router(_classify_routes.router)
 app.include_router(_pipeline_routes.router)
 
 
@@ -154,9 +156,6 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 from nadirclaw.api_models import (
     ChatCompletionRequest,
-    ChatMessage,
-    ClassifyBatchRequest,
-    ClassifyRequest,
     PipelineRequest,
 )
 
@@ -283,63 +282,7 @@ async def _periodic_state_cleanup():
 # Smart routing internals (re-exported from routing.py)
 # ---------------------------------------------------------------------------
 
-from nadirclaw.routing import smart_route_analysis as _smart_route_analysis  # noqa: E402
 from nadirclaw.routing import smart_route_full as _smart_route_full  # noqa: E402
-
-
-# ---------------------------------------------------------------------------
-# /v1/classify — dry-run classification (no LLM call)
-# ---------------------------------------------------------------------------
-
-@app.post("/v1/classify")
-async def classify_prompt(
-    request: ClassifyRequest,
-    current_user: UserSession = Depends(validate_local_auth),
-) -> Dict[str, Any]:
-    """Classify a prompt without calling any LLM."""
-    _, analysis = await _smart_route_analysis(
-        request.prompt, request.system_message or "", current_user
-    )
-
-    log_request({
-        "type": "classify",
-        "prompt": request.prompt,
-        **analysis,
-    })
-
-    return {
-        "prompt": request.prompt,
-        "classification": analysis,
-    }
-
-
-@app.post("/v1/classify/batch")
-async def classify_batch(
-    request: ClassifyBatchRequest,
-    current_user: UserSession = Depends(validate_local_auth),
-) -> Dict[str, Any]:
-    """Classify multiple prompts at once."""
-    results = []
-    for prompt in request.prompts:
-        _, analysis = await _smart_route_analysis(prompt, "", current_user)
-        results.append({
-            "prompt": prompt,
-            "selected_model": analysis.get("selected_model"),
-            "tier": analysis.get("tier"),
-            "confidence": analysis.get("confidence"),
-            "complexity_score": analysis.get("complexity_score"),
-        })
-        log_request({"type": "classify_batch", "prompt": prompt, **analysis})
-
-    simple_count = sum(1 for r in results if r["tier"] == "simple")
-    complex_count = sum(1 for r in results if r["tier"] == "complex")
-
-    return {
-        "total": len(results),
-        "simple": simple_count,
-        "complex": complex_count,
-        "results": results,
-    }
 
 
 # ---------------------------------------------------------------------------
