@@ -122,6 +122,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Mount feature-coherent route modules (extracted from this file).
+from nadirclaw.routes import blast as _blast_routes  # noqa: E402
+app.include_router(_blast_routes.router)
+
 
 # ---------------------------------------------------------------------------
 # Validation error handler — log request body for debugging
@@ -148,7 +152,6 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 # ---------------------------------------------------------------------------
 
 from nadirclaw.api_models import (
-    BlastPreviewRequest,
     ChatCompletionRequest,
     ChatMessage,
     ClassifyBatchRequest,
@@ -1775,60 +1778,6 @@ async def pipeline_by_id(
         return {"pipeline": db_result}
 
     raise HTTPException(404, f"Pipeline run {request_id} not found")
-
-
-# ---------------------------------------------------------------------------
-# /v1/blast — BLAST prompt optimization preview
-# ---------------------------------------------------------------------------
-
-@app.post("/v1/blast")
-async def blast_preview(
-    request: BlastPreviewRequest,
-    current_user: UserSession = Depends(validate_local_auth),
-):
-    """Preview BLAST prompt optimization without executing the pipeline.
-
-    If intent is not provided, it will be auto-classified.
-    """
-    from nadirclaw.blast import get_blast_optimizer
-
-    if not settings.BLAST_ENABLED:
-        raise HTTPException(400, "BLAST is disabled. Set NADIRCLAW_BLAST_ENABLED=true.")
-
-    intent = request.intent
-    if not intent:
-        from nadirclaw.intent import get_intent_classifier
-        classifier = get_intent_classifier()
-        intent_result = classifier.classify(request.prompt)
-        intent = intent_result.intent
-
-    optimizer = get_blast_optimizer()
-    result = await optimizer.optimize(request.prompt, intent)
-
-    # Build execution plan showing which models will be engaged
-    from nadirclaw.blast import build_execution_plan
-    from nadirclaw.pipeline import _get_pipeline_configs
-
-    configs = _get_pipeline_configs()
-    config = configs.get(intent, configs.get("code_generation", {}))
-    plan = build_execution_plan(
-        intent=intent,
-        sections=result.sections,
-        pipeline_config=config,
-        blast_model=settings.BLAST_MODEL,
-        used_llm=result.used_llm,
-    )
-    result.execution_plan = plan
-
-    return {
-        "original_prompt": result.original_prompt,
-        "enhanced_prompt": result.enhanced_prompt,
-        "intent": result.intent,
-        "sections": result.sections,
-        "latency_ms": result.latency_ms,
-        "used_llm": result.used_llm,
-        "execution_plan": result.execution_plan,
-    }
 
 
 # ---------------------------------------------------------------------------
