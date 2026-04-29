@@ -317,23 +317,25 @@ async def dispatch_raw(
     messages: List[Dict[str, str]],
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Dispatch a model call using raw message dicts (not ChatCompletionRequest).
 
-    This is the primary interface for the pipeline engine.
+    This is the primary interface for the pipeline engine and the chat
+    completions router.
     Returns {"content": str, "finish_reason": str, "prompt_tokens": int, "completion_tokens": int}.
     """
-    from nadirclaw.credentials import detect_provider, get_credential
+    from nadirclaw.credentials import detect_provider
 
-    provider = detect_provider(model)
+    provider_resolved = detect_provider(model)
 
-    if provider == "google":
-        return await _call_gemini_raw(model, messages, provider, temperature, max_tokens)
-    if provider == "anthropic":
+    if provider_resolved == "google":
+        return await _call_gemini_raw(model, messages, provider_resolved, temperature, max_tokens, top_p)
+    if provider_resolved == "anthropic":
         return await _call_claude_cli(model, messages, temperature, max_tokens)
-    if provider == "openai-codex":
+    if provider_resolved == "openai-codex":
         return await _call_codex_cli(model, messages, temperature, max_tokens)
-    return await _call_litellm_raw(model, messages, provider, temperature, max_tokens)
+    return await _call_litellm_raw(model, messages, provider_resolved, temperature, max_tokens, top_p)
 
 
 def _build_cloudcode_request(
@@ -342,6 +344,7 @@ def _build_cloudcode_request(
     project_id: str,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
 ) -> dict:
     """Build a request body for the cloudcode-pa Code Assist endpoint."""
     system_parts = []
@@ -362,6 +365,8 @@ def _build_cloudcode_request(
         gen_config["temperature"] = temperature
     if max_tokens is not None:
         gen_config["maxOutputTokens"] = max_tokens
+    if top_p is not None:
+        gen_config["topP"] = top_p
 
     inner: Dict[str, Any] = {"contents": contents}
     if gen_config:
@@ -403,6 +408,7 @@ async def _call_gemini_oauth(
     token: str,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
     _retry_count: int = 0,
 ) -> Dict[str, Any]:
     """Call Gemini via cloudcode-pa Code Assist endpoint using OAuth token."""
@@ -412,7 +418,7 @@ async def _call_gemini_oauth(
     meta = get_credential_metadata("gemini")
     project_id = meta.get("project_id", "")
 
-    body = _build_cloudcode_request(model, messages, project_id, temperature, max_tokens)
+    body = _build_cloudcode_request(model, messages, project_id, temperature, max_tokens, top_p)
     data = _json.dumps(body).encode()
     url = f"{_CLOUDCODE_ENDPOINT}:generateContent"
 
@@ -445,7 +451,9 @@ async def _call_gemini_oauth(
             if _retry_count < MAX_RETRIES:
                 logger.warning("Gemini rate limit — retrying in %ds", retry_delay)
                 await asyncio.sleep(retry_delay)
-                return await _call_gemini_oauth(model, messages, token, temperature, max_tokens, _retry_count + 1)
+                return await _call_gemini_oauth(
+                    model, messages, token, temperature, max_tokens, top_p, _retry_count + 1,
+                )
             raise RateLimitExhausted(model=model, retry_after=retry_delay)
         raise RuntimeError(f"Gemini API error {e.code}: {err_body}")
 
@@ -456,9 +464,15 @@ async def _call_gemini_raw(
     provider: str,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
     _retry_count: int = 0,
 ) -> Dict[str, Any]:
-    """Call Gemini — uses OAuth via cloudcode-pa if available, else SDK with API key."""
+    """Call Gemini — uses OAuth via cloudcode-pa if available, else SDK with API key.
+
+    Maps Gemini-native finish reasons (SAFETY / MAX_TOKENS) to OpenAI-style
+    (content_filter / length) and silently drops ``function_call`` parts so
+    the assistant message stays text-only.
+    """
     from nadirclaw.credentials import get_credential
 
     MAX_RETRIES = 1
@@ -472,7 +486,9 @@ async def _call_gemini_raw(
 
     # OAuth token → use cloudcode-pa endpoint (Gemini CLI compatible)
     if _is_oauth_token(token):
-        return await _call_gemini_oauth(model, messages, token, temperature, max_tokens, _retry_count)
+        return await _call_gemini_oauth(
+            model, messages, token, temperature, max_tokens, top_p, _retry_count,
+        )
 
     # API key → use google-genai SDK directly
     from google.genai import types
@@ -485,14 +501,14 @@ async def _call_gemini_raw(
     contents = []
     for m in messages:
         role = m.get("role", "user")
-        content = m.get("content", "")
+        content_text = m.get("content", "")
         if role in ("system", "developer"):
-            system_parts.append(content)
+            system_parts.append(content_text)
         else:
             contents.append(
                 types.Content(
                     role="user" if role == "user" else "model",
-                    parts=[types.Part.from_text(text=content)],
+                    parts=[types.Part.from_text(text=content_text)],
                 )
             )
 
@@ -501,6 +517,8 @@ async def _call_gemini_raw(
         gen_config_kwargs["temperature"] = temperature
     if max_tokens is not None:
         gen_config_kwargs["max_output_tokens"] = max_tokens
+    if top_p is not None:
+        gen_config_kwargs["top_p"] = top_p
 
     generate_kwargs: Dict[str, Any] = {"model": native_model, "contents": contents}
     if gen_config_kwargs or system_parts:
@@ -528,7 +546,9 @@ async def _call_gemini_raw(
                 retry_delay = min(int(float(delay_match.group(1))) + 2, 120)
             if _retry_count < MAX_RETRIES:
                 await asyncio.sleep(retry_delay)
-                return await _call_gemini_raw(model, messages, provider, temperature, max_tokens, _retry_count + 1)
+                return await _call_gemini_raw(
+                    model, messages, provider, temperature, max_tokens, top_p, _retry_count + 1,
+                )
             raise RateLimitExhausted(model=model, retry_after=retry_delay)
         raise
 
@@ -536,20 +556,55 @@ async def _call_gemini_raw(
     prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
     completion_tokens = getattr(usage, "candidates_token_count", 0) or 0
 
+    finish_reason = "stop"
     content = ""
+
     if response.candidates:
         candidate = response.candidates[0]
+        raw_reason = getattr(candidate, "finish_reason", None)
+        if raw_reason:
+            reason_str = str(raw_reason).lower()
+            if "safety" in reason_str:
+                finish_reason = "content_filter"
+            elif "length" in reason_str or "max_tokens" in reason_str:
+                finish_reason = "length"
+            logger.debug("Gemini finish_reason: %s", reason_str)
+
         if hasattr(candidate, "content") and candidate.content and candidate.content.parts:
-            text_parts = [p.text for p in candidate.content.parts if hasattr(p, "text") and p.text]
+            text_parts = []
+            for part in candidate.content.parts:
+                if hasattr(part, "text") and part.text:
+                    text_parts.append(part.text)
+                elif hasattr(part, "function_call") and part.function_call:
+                    logger.info(
+                        "Gemini returned function_call: %s (ignoring — NadirClaw doesn't execute tools)",
+                        part.function_call.name,
+                    )
             content = "".join(text_parts)
+    else:
+        feedback = getattr(response, "prompt_feedback", None)
+        if feedback:
+            logger.warning("Gemini blocked request: %s", feedback)
 
     if not content:
         try:
             content = response.text or ""
         except (ValueError, AttributeError):
             content = ""
+        if not content:
+            logger.warning(
+                "Gemini returned empty content for model=%s (finish_reason=%s, candidates=%d)",
+                native_model,
+                finish_reason,
+                len(response.candidates) if response.candidates else 0,
+            )
 
-    return {"content": content, "finish_reason": "stop", "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
+    return {
+        "content": content,
+        "finish_reason": finish_reason,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+    }
 
 
 async def _call_litellm_raw(
@@ -558,6 +613,7 @@ async def _call_litellm_raw(
     provider: Optional[str],
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Call LiteLLM with raw message dicts."""
     import litellm
@@ -575,17 +631,21 @@ async def _call_litellm_raw(
         call_kwargs["temperature"] = temperature
     if max_tokens is not None:
         call_kwargs["max_tokens"] = max_tokens
+    if top_p is not None:
+        call_kwargs["top_p"] = top_p
 
     if cred_provider and cred_provider != "ollama":
         api_key = get_credential(cred_provider)
         if api_key:
             call_kwargs["api_key"] = api_key
 
+    logger.debug("Calling LiteLLM: model=%s (provider=%s)", litellm_model, provider)
     try:
         response = await litellm.acompletion(**call_kwargs)
     except Exception as e:
         err_str = str(e).lower()
         if "429" in err_str or "rate" in err_str or "quota" in err_str or "resource_exhausted" in err_str:
+            logger.warning("LiteLLM 429 rate limit for model=%s: %s", litellm_model, e)
             raise RateLimitExhausted(model=model, retry_after=60)
         raise
 
@@ -605,8 +665,9 @@ def _rate_limit_error_response(model: str) -> Dict[str, Any]:
     """Build a graceful response when all models are rate-limited."""
     return {
         "content": (
-            "All configured models are currently rate-limited. "
-            "Please wait a minute and try again."
+            "⚠️ All configured models are currently rate-limited. "
+            "Please wait a minute and try again, or consider upgrading your API plan. "
+            "Check limits at https://ai.google.dev/gemini-api/docs/rate-limits"
         ),
         "finish_reason": "stop",
         "prompt_tokens": 0,
@@ -620,20 +681,103 @@ async def dispatch_with_fallback(
     fallback_model: Optional[str] = None,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
 ) -> tuple:
     """Try model, fall back to fallback_model on rate limit.
 
     Returns (response_data, actual_model_used).
     """
     try:
-        response = await dispatch_raw(model, messages, temperature, max_tokens)
+        response = await dispatch_raw(model, messages, temperature, max_tokens, top_p)
         return response, model
     except RateLimitExhausted:
         if fallback_model and fallback_model != model:
             logger.warning("Rate limit on %s — falling back to %s", model, fallback_model)
             try:
-                response = await dispatch_raw(fallback_model, messages, temperature, max_tokens)
+                response = await dispatch_raw(fallback_model, messages, temperature, max_tokens, top_p)
                 return response, fallback_model
             except RateLimitExhausted:
                 pass
         return _rate_limit_error_response(model), model
+
+
+async def call_with_tier_fallback(
+    selected_model: str,
+    messages: List[Dict[str, str]],
+    provider: Optional[str],
+    analysis_info: Dict[str, Any],
+    *,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    top_p: Optional[float] = None,
+) -> tuple:
+    """Try ``selected_model``; on rate limit, fall back to the other tier
+    (simple↔complex). Direct-model requests fall back to the simple tier.
+
+    The primary model retries internally (per-provider). The fallback runs
+    once with retries skipped to bound total wait. If both rate-limit, a
+    graceful canned response is returned with the original model name.
+
+    Returns ``(response_data, actual_model_used, updated_analysis_info)``.
+    """
+    from nadirclaw.credentials import detect_provider
+
+    try:
+        response_data = await dispatch_raw(
+            selected_model, messages, temperature, max_tokens, top_p,
+        )
+        return response_data, selected_model, analysis_info
+    except RateLimitExhausted:
+        if selected_model == settings.SIMPLE_MODEL:
+            fallback_model = settings.COMPLEX_MODEL
+        elif selected_model == settings.COMPLEX_MODEL:
+            fallback_model = settings.SIMPLE_MODEL
+        else:
+            fallback_model = settings.SIMPLE_MODEL
+
+        if fallback_model == selected_model:
+            logger.error(
+                "Rate limit on %s but fallback is the same model. Returning error.",
+                selected_model,
+            )
+            return _rate_limit_error_response(selected_model), selected_model, analysis_info
+
+        logger.warning(
+            "⚡ Rate limit on %s — falling back to %s",
+            selected_model, fallback_model,
+        )
+        fallback_provider = detect_provider(fallback_model)
+
+        try:
+            if fallback_provider == "google":
+                response_data = await _call_gemini_raw(
+                    fallback_model, messages, fallback_provider,
+                    temperature, max_tokens, top_p,
+                    _retry_count=99,  # one-shot, skip retries
+                )
+            elif fallback_provider == "anthropic":
+                response_data = await _call_claude_cli(
+                    fallback_model, messages, temperature, max_tokens,
+                )
+            elif fallback_provider == "openai-codex":
+                response_data = await _call_codex_cli(
+                    fallback_model, messages, temperature, max_tokens,
+                )
+            else:
+                response_data = await _call_litellm_raw(
+                    fallback_model, messages, fallback_provider,
+                    temperature, max_tokens, top_p,
+                )
+            updated = {
+                **analysis_info,
+                "fallback_from": selected_model,
+                "selected_model": fallback_model,
+                "strategy": analysis_info.get("strategy", "smart-routing") + "+fallback",
+            }
+            return response_data, fallback_model, updated
+        except RateLimitExhausted:
+            logger.error(
+                "Both %s and %s are rate-limited. Returning error.",
+                selected_model, fallback_model,
+            )
+            return _rate_limit_error_response(selected_model), selected_model, analysis_info

@@ -11,8 +11,6 @@ import json
 import logging
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from threading import Lock
 from typing import Any, Dict, List, Optional, Union
 
 from contextlib import asynccontextmanager
@@ -24,7 +22,6 @@ from sse_starlette.sse import EventSourceResponse
 
 from nadirclaw import __version__
 from nadirclaw.auth import UserSession, validate_local_auth
-from nadirclaw.dispatch import RateLimitExhausted
 from nadirclaw.events import event_bus
 from nadirclaw.settings import settings
 
@@ -288,392 +285,15 @@ from nadirclaw.routing import smart_route_full as _smart_route_full  # noqa: E40
 
 
 # ---------------------------------------------------------------------------
-# Model call helpers
+# Model dispatch — provider-specific call paths live in nadirclaw.dispatch.
 # ---------------------------------------------------------------------------
 
-def _strip_gemini_prefix(model: str) -> str:
-    """Remove 'gemini/' prefix if present (LiteLLM style → native name)."""
-    return model.removeprefix("gemini/")
+from nadirclaw.dispatch import call_with_tier_fallback  # noqa: E402
 
 
-# Shared Gemini clients — reused across requests, keyed by API key.
-# A lock ensures concurrent requests with different keys don't race.
-_gemini_clients: Dict[str, Any] = {}
-_gemini_client_lock = Lock()
-
-# Bounded thread pool for Gemini calls. Caps the number of concurrent
-# (and leaked-on-timeout) threads so they can't grow unbounded.
-_gemini_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="gemini")
-
-
-def _get_gemini_client(api_key: str):
-    """Get or create a thread-safe, per-key google-genai Client."""
-    with _gemini_client_lock:
-        if api_key not in _gemini_clients:
-            from google import genai
-            _gemini_clients[api_key] = genai.Client(api_key=api_key)
-        return _gemini_clients[api_key]
-
-
-async def _call_gemini(
-    model: str,
-    request: "ChatCompletionRequest",
-    provider: str,
-    _retry_count: int = 0,
-) -> Dict[str, Any]:
-    """Call a Gemini model using the native Google GenAI SDK.
-
-    Handles 429 rate-limit errors with automatic retry (up to 3 attempts).
-    """
-    import asyncio
-    import re
-
-    from google.genai import types
-    from google.genai.errors import ClientError
-
-    from nadirclaw.credentials import get_credential
-
-    MAX_RETRIES = 1  # Keep low — fallback handles the rest
-
-    api_key = get_credential(provider)
-    if not api_key:
-        raise HTTPException(
-            status_code=500,
-            detail="No Google/Gemini credential configured. "
-                   "Run: nadirclaw auth gemini login",
-        )
-
-    # OAuth token → use cloudcode-pa Code Assist endpoint
-    if api_key.startswith("ya29."):
-        from nadirclaw.dispatch import _call_gemini_oauth
-        messages = []
-        for m in request.messages:
-            messages.append({"role": m.role, "content": m.text_content()})
-        return await _call_gemini_oauth(
-            model, messages, api_key,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            _retry_count=_retry_count,
-        )
-
-    client = _get_gemini_client(api_key)
-    native_model = _strip_gemini_prefix(model)
-
-    # Build contents: separate system instruction from conversation messages
-    system_parts = []
-    contents = []
-    for m in request.messages:
-        if m.role in ("system", "developer"):
-            system_parts.append(m.text_content())
-        else:
-            contents.append(
-                types.Content(
-                    role="user" if m.role == "user" else "model",
-                    parts=[types.Part.from_text(text=m.text_content())],
-                )
-            )
-
-    # Build generation config
-    gen_config_kwargs: Dict[str, Any] = {}
-    if request.temperature is not None:
-        gen_config_kwargs["temperature"] = request.temperature
-    if request.max_tokens is not None:
-        gen_config_kwargs["max_output_tokens"] = request.max_tokens
-    if request.top_p is not None:
-        gen_config_kwargs["top_p"] = request.top_p
-
-    # NOTE: Function call parts are filtered out programmatically when
-    # extracting the response (see "handle function_call parts" below),
-    # so no prompt-level instruction is needed here.
-
-    generate_kwargs: Dict[str, Any] = {
-        "model": native_model,
-        "contents": contents,
-    }
-    if gen_config_kwargs:
-        generate_kwargs["config"] = types.GenerateContentConfig(
-            **gen_config_kwargs,
-            system_instruction="\n".join(system_parts) if system_parts else None,
-        )
-    elif system_parts:
-        generate_kwargs["config"] = types.GenerateContentConfig(
-            system_instruction="\n".join(system_parts),
-        )
-
-    logger.debug("Calling Gemini: model=%s (attempt %d/%d)", native_model, _retry_count + 1, MAX_RETRIES + 1)
-
-    # The google-genai SDK is synchronous; run in a bounded thread pool
-    # so timed-out threads don't accumulate unboundedly.
-    loop = asyncio.get_running_loop()
-    try:
-        response = await asyncio.wait_for(
-            loop.run_in_executor(
-                _gemini_executor,
-                lambda: client.models.generate_content(**generate_kwargs),
-            ),
-            timeout=120,  # 2 minute hard timeout
-        )
-    except asyncio.TimeoutError:
-        logger.error("Gemini API call timed out after 120s for model=%s", native_model)
-        return {
-            "content": "The model took too long to respond. Please try again.",
-            "finish_reason": "stop",
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-        }
-    except ClientError as e:
-        # Handle 429 rate-limit / quota errors with retry
-        if e.code == 429 or "RESOURCE_EXHAUSTED" in str(e):
-            # Try to extract retry delay from error message
-            retry_delay = 60  # default
-            err_str = str(e)
-            delay_match = re.search(r"retry in (\d+(?:\.\d+)?)s", err_str, re.IGNORECASE)
-            if delay_match:
-                retry_delay = min(int(float(delay_match.group(1))) + 2, 120)
-
-            if _retry_count < MAX_RETRIES:
-                logger.warning(
-                    "Gemini 429 rate limit for model=%s — retrying in %ds (attempt %d/%d)",
-                    native_model, retry_delay, _retry_count + 1, MAX_RETRIES,
-                )
-                await asyncio.sleep(retry_delay)
-                return await _call_gemini(model, request, provider, _retry_count + 1)
-            else:
-                # Exhausted retries — raise so the caller can try a fallback model
-                logger.error(
-                    "Gemini 429 rate limit persists after %d retries for model=%s. "
-                    "Free tier limit reached. Raising RateLimitExhausted for fallback.",
-                    MAX_RETRIES, native_model,
-                )
-                raise RateLimitExhausted(model=model, retry_after=retry_delay)
-        # Non-429 client errors — re-raise
-        raise
-
-    # Extract usage metadata
-    usage = getattr(response, "usage_metadata", None)
-    prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
-    completion_tokens = getattr(usage, "candidates_token_count", 0) or 0
-
-    # Extract finish reason and content
-    finish_reason = "stop"
-    content = ""
-
-    if response.candidates:
-        candidate = response.candidates[0]
-        raw_reason = getattr(candidate, "finish_reason", None)
-        if raw_reason:
-            reason_str = str(raw_reason).lower()
-            if "safety" in reason_str:
-                finish_reason = "content_filter"
-            elif "length" in reason_str or "max_tokens" in reason_str:
-                finish_reason = "length"
-            logger.debug("Gemini finish_reason: %s", reason_str)
-
-        # Extract text from parts (handle function_call parts gracefully)
-        if hasattr(candidate, "content") and candidate.content and candidate.content.parts:
-            text_parts = []
-            for part in candidate.content.parts:
-                if hasattr(part, "text") and part.text:
-                    text_parts.append(part.text)
-                elif hasattr(part, "function_call") and part.function_call:
-                    logger.info("Gemini returned function_call: %s (ignoring — NadirClaw doesn't execute tools)", part.function_call.name)
-            content = "".join(text_parts)
-    else:
-        # No candidates — check for prompt feedback (safety block)
-        feedback = getattr(response, "prompt_feedback", None)
-        if feedback:
-            logger.warning("Gemini blocked request: %s", feedback)
-
-    if not content:
-        # Try response.text as a fallback
-        try:
-            content = response.text or ""
-        except (ValueError, AttributeError):
-            content = ""
-        if not content:
-            logger.warning(
-                "Gemini returned empty content for model=%s (finish_reason=%s, candidates=%d)",
-                native_model, finish_reason, len(response.candidates) if response.candidates else 0,
-            )
-
-    return {
-        "content": content,
-        "finish_reason": finish_reason,
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-    }
-
-
-async def _call_litellm(
-    model: str,
-    request: "ChatCompletionRequest",
-    provider: str | None,
-) -> Dict[str, Any]:
-    """Call a model via LiteLLM (Anthropic, OpenAI, Ollama, etc.)."""
-    import litellm
-
-    from nadirclaw.credentials import get_credential
-
-    # For openai-codex provider, strip the prefix and route as OpenAI model
-    if provider == "openai-codex":
-        litellm_model = model.removeprefix("openai-codex/")
-        cred_provider = "openai-codex"
-    else:
-        litellm_model = model
-        cred_provider = provider
-
-    messages = [{"role": m.role, "content": m.text_content()} for m in request.messages]
-    call_kwargs: Dict[str, Any] = {"model": litellm_model, "messages": messages}
-    if request.temperature is not None:
-        call_kwargs["temperature"] = request.temperature
-    if request.max_tokens is not None:
-        call_kwargs["max_tokens"] = request.max_tokens
-    if request.top_p is not None:
-        call_kwargs["top_p"] = request.top_p
-
-    if cred_provider and cred_provider != "ollama":
-        api_key = get_credential(cred_provider)
-        if api_key:
-            call_kwargs["api_key"] = api_key
-
-    logger.debug("Calling LiteLLM: model=%s (provider=%s)", litellm_model, provider)
-    try:
-        response = await litellm.acompletion(**call_kwargs)
-    except Exception as e:
-        # Catch rate limit errors from any provider through LiteLLM
-        err_str = str(e).lower()
-        if "429" in err_str or "rate" in err_str or "quota" in err_str or "resource_exhausted" in err_str:
-            logger.warning("LiteLLM 429 rate limit for model=%s: %s", litellm_model, e)
-            raise RateLimitExhausted(model=model, retry_after=60)
-        raise
-
-    return {
-        "content": response.choices[0].message.content,
-        "finish_reason": response.choices[0].finish_reason or "stop",
-        "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
-        "completion_tokens": response.usage.completion_tokens if response.usage else 0,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Model dispatch + fallback on rate limit
-# ---------------------------------------------------------------------------
-
-async def _dispatch_model(
-    model: str,
-    request: "ChatCompletionRequest",
-    provider: str | None,
-) -> Dict[str, Any]:
-    """Call the right backend (Gemini native or LiteLLM) for a model.
-
-    Raises RateLimitExhausted if the model is rate-limited after retries.
-    """
-    from nadirclaw.telemetry import trace_span
-
-    with trace_span("dispatch_model", {"gen_ai.request.model": model, "gen_ai.system": provider or ""}):
-        if provider == "google":
-            return await _call_gemini(model, request, provider)
-        if provider == "anthropic":
-            from nadirclaw.dispatch import _call_claude_cli
-            messages = [{"role": m.role, "content": m.text_content()} for m in request.messages]
-            return await _call_claude_cli(
-                model, messages,
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
-            )
-        if provider == "openai-codex":
-            from nadirclaw.dispatch import _call_codex_cli
-            messages = [{"role": m.role, "content": m.text_content()} for m in request.messages]
-            return await _call_codex_cli(
-                model, messages,
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
-            )
-        return await _call_litellm(model, request, provider)
-
-
-async def _call_with_fallback(
-    selected_model: str,
-    request: "ChatCompletionRequest",
-    provider: str | None,
-    analysis_info: Dict[str, Any],
-) -> tuple:
-    """Try the selected model; on rate limit, fall back to the other tier.
-
-    The primary model retries up to MAX_RETRIES times.
-    The fallback model is tried once (no retries) to avoid long waits.
-
-    Returns (response_data, actual_model_used, updated_analysis_info).
-    """
-    from nadirclaw.credentials import detect_provider
-
-    try:
-        response_data = await _dispatch_model(selected_model, request, provider)
-        return response_data, selected_model, analysis_info
-    except RateLimitExhausted as e:
-        # Determine fallback model (swap tiers)
-        if selected_model == settings.SIMPLE_MODEL:
-            fallback_model = settings.COMPLEX_MODEL
-        elif selected_model == settings.COMPLEX_MODEL:
-            fallback_model = settings.SIMPLE_MODEL
-        else:
-            # Direct model request — try simple first, then complex
-            fallback_model = settings.SIMPLE_MODEL
-
-        # Don't fall back to the same model
-        if fallback_model == selected_model:
-            logger.error(
-                "Rate limit on %s but fallback is the same model. Returning error.",
-                selected_model,
-            )
-            return _rate_limit_error_response(selected_model), selected_model, analysis_info
-
-        logger.warning(
-            "⚡ Rate limit on %s — falling back to %s",
-            selected_model, fallback_model,
-        )
-        fallback_provider = detect_provider(fallback_model)
-
-        try:
-            # Call fallback without retries — one shot only.
-            # Pass _retry_count >= MAX_RETRIES so it raises immediately on 429.
-            if fallback_provider == "google":
-                response_data = await _call_gemini(
-                    fallback_model, request, fallback_provider,
-                    _retry_count=99,  # Skip retries — one shot only
-                )
-            else:
-                response_data = await _call_litellm(
-                    fallback_model, request, fallback_provider,
-                )
-            analysis_info = {
-                **analysis_info,
-                "fallback_from": selected_model,
-                "selected_model": fallback_model,
-                "strategy": analysis_info.get("strategy", "smart-routing") + "+fallback",
-            }
-            return response_data, fallback_model, analysis_info
-        except RateLimitExhausted:
-            # Both models are rate-limited
-            logger.error(
-                "Both %s and %s are rate-limited. Returning error.",
-                selected_model, fallback_model,
-            )
-            return _rate_limit_error_response(selected_model), selected_model, analysis_info
-
-
-def _rate_limit_error_response(model: str) -> Dict[str, Any]:
-    """Build a graceful response when all models are rate-limited."""
-    return {
-        "content": (
-            "⚠️ All configured models are currently rate-limited. "
-            "Please wait a minute and try again, or consider upgrading your API plan. "
-            "Check limits at https://ai.google.dev/gemini-api/docs/rate-limits"
-        ),
-        "finish_reason": "stop",
-        "prompt_tokens": 0,
-        "completion_tokens": 0,
-    }
+def _request_to_messages(request: "ChatCompletionRequest") -> List[Dict[str, str]]:
+    """Convert a Pydantic ChatCompletionRequest into raw role/content dicts."""
+    return [{"role": m.role, "content": m.text_content()} for m in request.messages]
 
 
 # ---------------------------------------------------------------------------
@@ -716,8 +336,14 @@ async def chat_completions(
 
         provider = detect_provider(request.model)
         try:
-            response_data, _, _ = await _call_with_fallback(
-                request.model, request, provider, {"strategy": "force_model", "tier": "direct"},
+            response_data, _, _ = await call_with_tier_fallback(
+                request.model,
+                _request_to_messages(request),
+                provider,
+                {"strategy": "force_model", "tier": "direct"},
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+                top_p=request.top_p,
             )
             elapsed_ms = int((time.time() - start_time) * 1000)
             content = response_data.get("content", "")
@@ -1061,8 +687,14 @@ async def chat_completions(
         from nadirclaw.telemetry import record_llm_call, trace_span
 
         with trace_span("chat_completion", {"nadirclaw.tier": analysis_info.get("tier")}) as span:
-            response_data, selected_model, analysis_info = await _call_with_fallback(
-                selected_model, request, provider, analysis_info,
+            response_data, selected_model, analysis_info = await call_with_tier_fallback(
+                selected_model,
+                _request_to_messages(request),
+                provider,
+                analysis_info,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+                top_p=request.top_p,
             )
 
             elapsed_ms = int((time.time() - start_time) * 1000)
