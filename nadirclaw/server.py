@@ -195,6 +195,60 @@ def _extract_request_metadata(request: ChatCompletionRequest) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Request preprocessing — rate-limit, size guard, id/timestamp, metadata
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass  # noqa: E402
+
+
+@dataclass
+class _RequestContext:
+    """Per-request scratch space shared between routing/dispatch/response stages."""
+    request_id: str
+    start_time: float
+    prompt_text: str
+    req_meta: Dict[str, Any]
+
+
+def _preprocess_request(
+    request: ChatCompletionRequest, current_user: UserSession
+) -> _RequestContext:
+    """Run pre-flight checks and gather data needed by every downstream stage.
+
+    Raises ``HTTPException(429)`` when the per-user rate limit is exceeded
+    and ``HTTPException(413)`` when total message content exceeds
+    ``_MAX_CONTENT_LENGTH``.
+    """
+    retry_after = _rate_limiter.check(current_user.id)
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded. Retry after {retry_after}s.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    total_content_len = sum(len(m.text_content()) for m in request.messages)
+    if total_content_len > _MAX_CONTENT_LENGTH:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Request content too large ({total_content_len:,} chars). "
+                f"Maximum is {_MAX_CONTENT_LENGTH:,} chars."
+            ),
+        )
+
+    user_msgs = [m.text_content() for m in request.messages if m.role == "user"]
+    prompt_text = user_msgs[-1] if user_msgs else ""
+
+    return _RequestContext(
+        request_id=str(uuid.uuid4()),
+        start_time=time.time(),
+        prompt_text=prompt_text,
+        req_meta=_extract_request_metadata(request),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
 
@@ -305,26 +359,9 @@ async def chat_completions(
     request: ChatCompletionRequest,
     current_user: UserSession = Depends(validate_local_auth),
 ):
-    # --- Rate limiting (per user) ---
-    retry_after = _rate_limiter.check(current_user.id)
-    if retry_after is not None:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded. Retry after {retry_after}s.",
-            headers={"Retry-After": str(retry_after)},
-        )
-
-    # --- Input size validation ---
-    total_content_len = sum(len(m.text_content()) for m in request.messages)
-    if total_content_len > _MAX_CONTENT_LENGTH:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Request content too large ({total_content_len:,} chars). "
-                   f"Maximum is {_MAX_CONTENT_LENGTH:,} chars.",
-        )
-
-    start_time = time.time()
-    request_id = str(uuid.uuid4())
+    ctx = _preprocess_request(request, current_user)
+    request_id = ctx.request_id
+    start_time = ctx.start_time
 
     # --- Pipeline V2: force_model bypass (prevents re-routing for orchestrator self-calls) ---
     extra = request.model_extra or {}
@@ -375,12 +412,8 @@ async def chat_completions(
             raise HTTPException(status_code=500, detail=f"Force-model dispatch failed: {e}")
 
     try:
-        # Extract prompt for logging
-        user_msgs = [m.text_content() for m in request.messages if m.role == "user"]
-        prompt_text = user_msgs[-1] if user_msgs else ""
-
-        # Extract request metadata for enhanced logging
-        req_meta = _extract_request_metadata(request)
+        prompt_text = ctx.prompt_text
+        req_meta = ctx.req_meta
 
         from nadirclaw.routing import (
             apply_routing_modifiers,
