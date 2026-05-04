@@ -348,6 +348,111 @@ from nadirclaw.routing import smart_route_full as _smart_route_full  # noqa: E40
 # Route selection — picks the model + builds analysis_info
 # ---------------------------------------------------------------------------
 
+async def _handle_force_model(
+    request: ChatCompletionRequest,
+    ctx: "_RequestContext",
+) -> Optional[Any]:
+    """Pipeline-V2 self-call bypass — skip routing entirely.
+
+    Returns the response when ``x_nadirclaw_force_model`` is set and a model
+    is provided. Returns ``None`` when force-model isn't requested (or no
+    model is given) so the caller falls through to normal routing. Raises
+    ``HTTPException(500)`` if the underlying dispatch fails — this branch
+    has no fallback by design.
+    """
+    extra = request.model_extra or {}
+    if not extra.get("x_nadirclaw_force_model", False):
+        return None
+    if not request.model:
+        return None
+
+    from nadirclaw.credentials import detect_provider
+
+    provider = detect_provider(request.model)
+    try:
+        response_data, _, _ = await call_with_tier_fallback(
+            request.model,
+            _request_to_messages(request),
+            provider,
+            {"strategy": "force_model", "tier": "direct"},
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            top_p=request.top_p,
+        )
+        elapsed_ms = int((time.time() - ctx.start_time) * 1000)
+        content = response_data.get("content", "")
+
+        if request.stream:
+            return _build_streaming_response(
+                ctx.request_id, request.model, response_data,
+                {"strategy": "force_model"}, elapsed_ms,
+            )
+
+        return {
+            "id": ctx.request_id,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": request.model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": response_data.get("finish_reason", "stop"),
+            }],
+            "usage": {
+                "prompt_tokens": response_data.get("prompt_tokens", 0),
+                "completion_tokens": response_data.get("completion_tokens", 0),
+                "total_tokens": response_data.get("prompt_tokens", 0) + response_data.get("completion_tokens", 0),
+            },
+        }
+    except Exception as e:
+        logger.error("Force-model dispatch failed for %s: %s", request.model, e)
+        raise HTTPException(status_code=500, detail=f"Force-model dispatch failed: {e}")
+
+
+async def _dispatch_single_model(
+    request: ChatCompletionRequest,
+    ctx: "_RequestContext",
+    *,
+    selected_model: str,
+    analysis_info: Dict[str, Any],
+) -> tuple:
+    """Run the single-model dispatch path with tier-fallback + telemetry.
+
+    Wraps ``call_with_tier_fallback`` in a trace span and emits
+    ``record_llm_call`` for the chosen provider. Returns
+    ``(response_data, selected_model, analysis_info, provider, elapsed_ms)``.
+    """
+    from nadirclaw.credentials import detect_provider
+    from nadirclaw.telemetry import record_llm_call, trace_span
+
+    provider = detect_provider(selected_model)
+
+    with trace_span("chat_completion", {"nadirclaw.tier": analysis_info.get("tier")}) as span:
+        response_data, selected_model, analysis_info = await call_with_tier_fallback(
+            selected_model,
+            _request_to_messages(request),
+            provider,
+            analysis_info,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            top_p=request.top_p,
+        )
+
+        elapsed_ms = int((time.time() - ctx.start_time) * 1000)
+
+        record_llm_call(
+            span,
+            model=selected_model,
+            provider=provider,
+            prompt_tokens=response_data["prompt_tokens"],
+            completion_tokens=response_data["completion_tokens"],
+            tier=analysis_info.get("tier"),
+            latency_ms=elapsed_ms,
+        )
+
+    return response_data, selected_model, analysis_info, provider, elapsed_ms
+
+
 async def _try_parallel_dispatch(
     request: ChatCompletionRequest,
     ctx: "_RequestContext",
@@ -809,59 +914,26 @@ async def chat_completions(
     request: ChatCompletionRequest,
     current_user: UserSession = Depends(validate_local_auth),
 ):
+    """OpenAI-compatible /v1/chat/completions — orchestrates routing → dispatch → response.
+
+    Pipeline:
+      1. ``_preprocess_request`` — rate limit, size guard, ctx with id/timestamps/metadata.
+      2. ``_handle_force_model`` — Pipeline-V2 self-call bypass (early return if set).
+      3. Pipeline pseudo-model bypass — delegate to ``/v1/pipeline``.
+      4. ``_select_route`` — pick model + build analysis_info.
+      5. ``_try_parallel_dispatch`` / ``_try_pipeline_v2`` — short-circuit dispatchers.
+      6. ``_dispatch_single_model`` — call_with_tier_fallback + telemetry.
+      7. ``_finalize_response`` — log + history + dashboard event + JSON/SSE return.
+
+    All HTTP-shape errors propagate as-is; unexpected exceptions are
+    caught, logged with the request_id, and converted to a 500 response.
+    """
     ctx = _preprocess_request(request, current_user)
-    request_id = ctx.request_id
-    start_time = ctx.start_time
 
-    # --- Pipeline V2: force_model bypass (prevents re-routing for orchestrator self-calls) ---
-    extra = request.model_extra or {}
-    force_model = extra.get("x_nadirclaw_force_model", False)
+    forced = await _handle_force_model(request, ctx)
+    if forced is not None:
+        return forced
 
-    if force_model and request.model:
-        from nadirclaw.credentials import detect_provider
-        from nadirclaw.telemetry import record_llm_call, trace_span
-
-        provider = detect_provider(request.model)
-        try:
-            response_data, _, _ = await call_with_tier_fallback(
-                request.model,
-                _request_to_messages(request),
-                provider,
-                {"strategy": "force_model", "tier": "direct"},
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
-                top_p=request.top_p,
-            )
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            content = response_data.get("content", "")
-
-            if request.stream:
-                return _build_streaming_response(
-                    request_id, request.model, response_data,
-                    {"strategy": "force_model"}, elapsed_ms,
-                )
-
-            return {
-                "id": request_id,
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": request.model,
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": content},
-                    "finish_reason": response_data.get("finish_reason", "stop"),
-                }],
-                "usage": {
-                    "prompt_tokens": response_data.get("prompt_tokens", 0),
-                    "completion_tokens": response_data.get("completion_tokens", 0),
-                    "total_tokens": response_data.get("prompt_tokens", 0) + response_data.get("completion_tokens", 0),
-                },
-            }
-        except Exception as e:
-            logger.error("Force-model dispatch failed for %s: %s", request.model, e)
-            raise HTTPException(status_code=500, detail=f"Force-model dispatch failed: {e}")
-
-    # --- Pipeline pseudo-model bypass (delegate to /v1/pipeline) ---
     if request.model in ("pipeline", "nadirclaw/pipeline"):
         pipeline_req = PipelineRequest(
             messages=request.messages,
@@ -872,13 +944,8 @@ async def chat_completions(
         return await pipeline_endpoint(pipeline_req, current_user)
 
     try:
-        prompt_text = ctx.prompt_text
-        req_meta = ctx.req_meta
-
         selected_model, analysis_info = await _select_route(request, current_user, ctx)
 
-        # Short-circuit dispatchers — return a full response when their gate
-        # triggers, or None to fall through to single-model dispatch below.
         parallel_response = await _try_parallel_dispatch(request, ctx, analysis_info)
         if parallel_response is not None:
             return parallel_response
@@ -887,38 +954,13 @@ async def chat_completions(
         if v2_response is not None:
             return v2_response
 
-        # Resolve provider credential
-        from nadirclaw.credentials import detect_provider, get_credential
-
-        provider = detect_provider(selected_model)
-
-        # ------------------------------------------------------------------
-        # Call model — with automatic fallback on rate limit
-        # ------------------------------------------------------------------
-        from nadirclaw.telemetry import record_llm_call, trace_span
-
-        with trace_span("chat_completion", {"nadirclaw.tier": analysis_info.get("tier")}) as span:
-            response_data, selected_model, analysis_info = await call_with_tier_fallback(
-                selected_model,
-                _request_to_messages(request),
-                provider,
-                analysis_info,
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
-                top_p=request.top_p,
+        response_data, selected_model, analysis_info, provider, elapsed_ms = (
+            await _dispatch_single_model(
+                request, ctx,
+                selected_model=selected_model,
+                analysis_info=analysis_info,
             )
-
-            elapsed_ms = int((time.time() - start_time) * 1000)
-
-            record_llm_call(
-                span,
-                model=selected_model,
-                provider=provider,
-                prompt_tokens=response_data["prompt_tokens"],
-                completion_tokens=response_data["completion_tokens"],
-                tier=analysis_info.get("tier"),
-                latency_ms=elapsed_ms,
-            )
+        )
 
         return await _finalize_response(
             request=request,
@@ -931,20 +973,20 @@ async def chat_completions(
         )
 
     except HTTPException:
-        raise  # Re-raise FastAPI HTTP exceptions as-is
+        raise
     except Exception as e:
-        elapsed_ms = int((time.time() - start_time) * 1000)
+        elapsed_ms = int((time.time() - ctx.start_time) * 1000)
         logger.error("Completion error: %s", e, exc_info=True)
         log_request({
             "type": "completion",
-            "request_id": request_id,
+            "request_id": ctx.request_id,
             "status": "error",
             "error": str(e),
             "total_latency_ms": elapsed_ms,
         })
         raise HTTPException(
             status_code=500,
-            detail=f"An internal error occurred. Request ID: {request_id}",
+            detail=f"An internal error occurred. Request ID: {ctx.request_id}",
         )
 
 
