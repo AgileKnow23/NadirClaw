@@ -542,6 +542,140 @@ async def _try_pipeline_v2(
         return None
 
 
+async def _finalize_response(
+    *,
+    request: ChatCompletionRequest,
+    ctx: "_RequestContext",
+    response_data: Dict[str, Any],
+    selected_model: str,
+    analysis_info: Dict[str, Any],
+    provider: Optional[str],
+    elapsed_ms: int,
+) -> Any:
+    """Wrap a completed dispatch into a client-facing response.
+
+    Performs three side effects (in order):
+      1. Build + write the enriched log entry via ``log_request``.
+      2. Fire-and-forget the session-history write (``log_completion_async``).
+      3. Fire-and-forget the live-dashboard event publish.
+
+    Returns the OpenAI-compatible JSON dict, or an ``EventSourceResponse``
+    when ``request.stream`` is true.
+    """
+    from nadirclaw.routing import estimate_cost
+
+    total_tokens = response_data["prompt_tokens"] + response_data["completion_tokens"]
+
+    log_entry: Dict[str, Any] = {
+        "type": "completion",
+        "request_id": ctx.request_id,
+        "prompt": ctx.prompt_text,
+        "selected_model": selected_model,
+        "provider": provider,
+        "tier": analysis_info.get("tier"),
+        "confidence": analysis_info.get("confidence"),
+        "complexity_score": analysis_info.get("complexity_score"),
+        "classifier_latency_ms": analysis_info.get("classifier_latency_ms"),
+        "total_latency_ms": elapsed_ms,
+        "prompt_tokens": response_data["prompt_tokens"],
+        "completion_tokens": response_data["completion_tokens"],
+        "total_tokens": total_tokens,
+        "response_preview": (response_data["content"] or "")[:100],
+        "fallback_used": analysis_info.get("fallback_from"),
+        "status": "ok",
+        **ctx.req_meta,
+    }
+
+    if settings.LOG_RAW:
+        log_entry["raw_messages"] = [
+            {"role": m.role, "content": m.text_content()} for m in request.messages
+        ]
+        log_entry["raw_response"] = response_data.get("content", "")
+
+    log_entry["estimated_cost_usd"] = estimate_cost(
+        selected_model,
+        response_data["prompt_tokens"],
+        response_data["completion_tokens"],
+    )
+    log_entry["messages"] = [
+        {"role": m.role, "content": m.text_content()} for m in request.messages
+    ]
+    log_entry["response_text"] = response_data.get("content", "")
+    log_entry["system_prompt"] = next(
+        (m.text_content() for m in request.messages if m.role == "system"), ""
+    )
+
+    log_request(log_entry)
+
+    # Session history (SurrealDB + vector embedding) — fire and forget.
+    try:
+        from nadirclaw.history_middleware import log_completion_async
+        asyncio.create_task(log_completion_async(
+            request_id=ctx.request_id,
+            messages=[{"role": m.role, "content": m.text_content()} for m in request.messages],
+            model=selected_model,
+            provider=provider,
+            tier=analysis_info.get("tier", "unknown"),
+            response_text=response_data.get("content", ""),
+            prompt_tokens=response_data["prompt_tokens"],
+            completion_tokens=response_data["completion_tokens"],
+            latency_ms=elapsed_ms,
+            stream=request.stream,
+        ))
+    except Exception:
+        pass  # Never break the main flow.
+
+    # Live-dashboard event — fire and forget.
+    try:
+        asyncio.create_task(event_bus.publish({
+            "event_type": "routing_decision",
+            "request_id": ctx.request_id,
+            "tier": analysis_info.get("tier"),
+            "selected_model": selected_model,
+            "strategy": analysis_info.get("strategy"),
+            "confidence": analysis_info.get("confidence"),
+            "complexity_score": analysis_info.get("complexity_score"),
+            "classifier_latency_ms": analysis_info.get("classifier_latency_ms"),
+            "total_latency_ms": elapsed_ms,
+            "prompt_tokens": response_data["prompt_tokens"],
+            "completion_tokens": response_data["completion_tokens"],
+            "prompt_preview": ctx.prompt_text[:80],
+            "agentic": bool(analysis_info.get("routing_modifiers", {}).get("agentic", {}).get("is_agentic")),
+            "reasoning": bool(analysis_info.get("routing_modifiers", {}).get("reasoning", {}).get("is_reasoning")),
+            "fallback_used": analysis_info.get("fallback_from"),
+            "status": "ok",
+        }))
+    except Exception:
+        pass  # Never break the main flow.
+
+    if request.stream:
+        return _build_streaming_response(
+            ctx.request_id, selected_model, response_data, analysis_info, elapsed_ms,
+        )
+
+    return {
+        "id": ctx.request_id,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": selected_model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": response_data["content"]},
+            "finish_reason": response_data["finish_reason"],
+        }],
+        "usage": {
+            "prompt_tokens": response_data["prompt_tokens"],
+            "completion_tokens": response_data["completion_tokens"],
+            "total_tokens": total_tokens,
+        },
+        "nadirclaw_metadata": {
+            "request_id": ctx.request_id,
+            "response_time_ms": elapsed_ms,
+            "routing": analysis_info,
+        },
+    }
+
+
 async def _select_route(
     request: ChatCompletionRequest,
     current_user: UserSession,
@@ -775,7 +909,6 @@ async def chat_completions(
             )
 
             elapsed_ms = int((time.time() - start_time) * 1000)
-            total_tokens = response_data["prompt_tokens"] + response_data["completion_tokens"]
 
             record_llm_call(
                 span,
@@ -787,124 +920,15 @@ async def chat_completions(
                 latency_ms=elapsed_ms,
             )
 
-        log_entry = {
-            "type": "completion",
-            "request_id": request_id,
-            "prompt": prompt_text,
-            "selected_model": selected_model,
-            "provider": provider,
-            "tier": analysis_info.get("tier"),
-            "confidence": analysis_info.get("confidence"),
-            "complexity_score": analysis_info.get("complexity_score"),
-            "classifier_latency_ms": analysis_info.get("classifier_latency_ms"),
-            "total_latency_ms": elapsed_ms,
-            "prompt_tokens": response_data["prompt_tokens"],
-            "completion_tokens": response_data["completion_tokens"],
-            "total_tokens": total_tokens,
-            "response_preview": (response_data["content"] or "")[:100],
-            "fallback_used": analysis_info.get("fallback_from"),
-            "status": "ok",
-            **req_meta,
-        }
-
-        if settings.LOG_RAW:
-            log_entry["raw_messages"] = [
-                {"role": m.role, "content": m.text_content()} for m in request.messages
-            ]
-            log_entry["raw_response"] = response_data.get("content", "")
-
-        # Enrich with cost estimate and full conversation for DB storage
-        from nadirclaw.routing import estimate_cost
-        log_entry["estimated_cost_usd"] = estimate_cost(
-            selected_model,
-            response_data["prompt_tokens"],
-            response_data["completion_tokens"],
+        return await _finalize_response(
+            request=request,
+            ctx=ctx,
+            response_data=response_data,
+            selected_model=selected_model,
+            analysis_info=analysis_info,
+            provider=provider,
+            elapsed_ms=elapsed_ms,
         )
-        log_entry["messages"] = [
-            {"role": m.role, "content": m.text_content()} for m in request.messages
-        ]
-        log_entry["response_text"] = response_data.get("content", "")
-        log_entry["system_prompt"] = next(
-            (m.text_content() for m in request.messages if m.role == "system"), ""
-        )
-
-        log_request(log_entry)
-
-        # Log to session history (SurrealDB + vector embedding) — fire and forget
-        try:
-            from nadirclaw.history_middleware import log_completion_async
-            asyncio.create_task(log_completion_async(
-                request_id=request_id,
-                messages=[{"role": m.role, "content": m.text_content()} for m in request.messages],
-                model=selected_model,
-                provider=provider,
-                tier=analysis_info.get("tier", "unknown"),
-                response_text=response_data.get("content", ""),
-                prompt_tokens=response_data["prompt_tokens"],
-                completion_tokens=response_data["completion_tokens"],
-                latency_ms=elapsed_ms,
-                stream=request.stream,
-            ))
-        except Exception:
-            pass  # Never break the main flow
-
-        # Publish to event bus for real-time dashboard
-        asyncio.create_task(event_bus.publish({
-            "event_type": "routing_decision",
-            "request_id": request_id,
-            "tier": analysis_info.get("tier"),
-            "selected_model": selected_model,
-            "strategy": analysis_info.get("strategy"),
-            "confidence": analysis_info.get("confidence"),
-            "complexity_score": analysis_info.get("complexity_score"),
-            "classifier_latency_ms": analysis_info.get("classifier_latency_ms"),
-            "total_latency_ms": elapsed_ms,
-            "prompt_tokens": response_data["prompt_tokens"],
-            "completion_tokens": response_data["completion_tokens"],
-            "prompt_preview": prompt_text[:80],
-            "agentic": bool(analysis_info.get("routing_modifiers", {}).get("agentic", {}).get("is_agentic")),
-            "reasoning": bool(analysis_info.get("routing_modifiers", {}).get("reasoning", {}).get("is_reasoning")),
-            "fallback_used": analysis_info.get("fallback_from"),
-            "status": "ok",
-        }))
-
-        # ------------------------------------------------------------------
-        # Streaming response (SSE) — for OpenClaw / streaming clients
-        # ------------------------------------------------------------------
-        if request.stream:
-            return _build_streaming_response(
-                request_id, selected_model, response_data, analysis_info, elapsed_ms,
-            )
-
-        # ------------------------------------------------------------------
-        # Non-streaming response (regular JSON)
-        # ------------------------------------------------------------------
-        return {
-            "id": request_id,
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": selected_model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": response_data["content"],
-                    },
-                    "finish_reason": response_data["finish_reason"],
-                }
-            ],
-            "usage": {
-                "prompt_tokens": response_data["prompt_tokens"],
-                "completion_tokens": response_data["completion_tokens"],
-                "total_tokens": response_data["prompt_tokens"] + response_data["completion_tokens"],
-            },
-            "nadirclaw_metadata": {
-                "request_id": request_id,
-                "response_time_ms": elapsed_ms,
-                "routing": analysis_info,
-            },
-        }
 
     except HTTPException:
         raise  # Re-raise FastAPI HTTP exceptions as-is
