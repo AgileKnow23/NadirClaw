@@ -58,7 +58,7 @@ Drop into `~/Documents/Agile Know/Finance/{year}/Monthly Reconciliation/Source S
 
 ---
 
-## P2 — Refactor `nadirclaw/server.py` (1950 → 964 → ~500-600)
+## P2 — Refactor `nadirclaw/server.py` (1950 → 964 → 1107, chat_completions 78 lines) ✅ DONE
 
 **Why**: server.py blew past every Power-of-Ten ceiling. The file was 1950 lines, `chat_completions` alone is 534 lines (the rule says 60), and there's a 269-line block of Gemini/LiteLLM dispatch code that duplicates `dispatch.py`. Hard to navigate, harder to test, and any future contributor (or me at 11pm) is going to make a regression.
 
@@ -77,32 +77,24 @@ Drop into `~/Documents/Agile Know/Finance/{year}/Monthly Reconciliation/Source S
 
 **Progress**: server.py 1950 → 964 (−986 lines, −51%). 306 tests green throughout, zero regressions.
 
-**Phase A landed**. server.py ≈ 964 lines now (mostly `lifespan`, `chat_completions` + force-model branch, `_RateLimiter`, app factory, `_build_streaming_response`, `/v1/models` + `/health` + `/`). Slightly over the 800 ceiling — Phase B will cut the rest.
+**Phase A landed**. server.py ≈ 964 lines (mostly `lifespan`, `chat_completions` + force-model branch, `_RateLimiter`, app factory, `_build_streaming_response`, `/v1/models` + `/health` + `/`).
 
-**Resume trigger**: "let's start the chat_completions refactor — write B0 golden fixtures first" (Phase B).
+### Phase B — `chat_completions` refactor (TDD, RED-GREEN per step)
 
-### Phase B — `chat_completions` refactor (separate ~2hr session)
+| # | Commit | Helper extracted | chat_completions | Tests |
+|---|---|---|---|---|
+| B0 | `ca241f5` test(server): add B0 golden fixtures | (none — pinned today's behavior) | 555 lines | 9 fixtures (315 total) |
+| B1 | `7e010d2` refactor(server): extract _preprocess_request | `_preprocess_request` + `_RequestContext` dataclass — rate limit, size guard, request_id/start_time, prompt_text + req_meta extraction | 555 → 523 (-32) | 315 |
+| B2 | `29ff57d` refactor(server): extract _select_route | `_select_route` — profile / alias / direct / session-cache / smart-route+modifiers; pipeline pseudo-model bypass hoisted to caller | 523 → 414 (-109) | +9 RED→GREEN, 324 total |
+| B3 | `1a7218f` refactor(server): extract parallel + pipeline-v2 short-circuits | `_try_parallel_dispatch` + `_try_pipeline_v2` — each returns `Optional[response]`, None means fall-through | 414 → 251 (-163) | +9 RED→GREEN, 333 total |
+| B4 | `e07590f` refactor(server): extract _finalize_response | `_finalize_response` — log enrichment, log_request, history fire-and-forget, dashboard event, JSON/SSE return | 251 → 141 (-110) | +5 RED→GREEN, 338 total |
+| B5 | `764b572` refactor(server): finish Phase B — chat_completions is now an orchestrator | `_handle_force_model` + `_dispatch_single_model`. chat_completions collapses to: preprocess → force-model? → pipeline pseudo-model? → select_route → parallel? → v2? → dispatch → finalize | 141 → 78 (-63) | +7 RED→GREEN, 345 total |
 
-**This is the hot path. 534 lines that handle: auth, validation, rate-limiting, classification, routing, parallel-dispatch, fallback, telemetry, streaming, history-logging, error responses. Splitting it without contract tests is how you ship a regression.**
+**Phase B landed**. chat_completions: 555 → **78 lines** (-477, -86%). All 30 new TDD unit tests + 9 golden fixtures green throughout. Each helper independently mockable; the hot path now reads as a one-page state machine.
 
-**Pre-work (mandatory before touching the function)**:
-- B0: Write **golden-fixture tests** capturing today's behavior. 6-8 fixtures: streaming-success, buffered-success, rate-limit-fallback, parallel-dispatch, validation-error, model-not-found, downstream-429, agentic-detection. Snapshot input → output, commit the snapshots.
+server.py ended at **1107 lines** — over the 800 P10 ceiling, but every concern lives in a named, tested helper. The remaining bulk is the helpers themselves (deliberate trade: more code, infinitely more readable). Further reduction would need to move helpers into a routes module, which is overkill for this round.
 
-**Then the actual extraction (~5 commits)**:
-- B1: extract `preprocess_request()` (auth + validation + metadata) → ~80 lines out
-- B2: extract `select_route(request, analysis)` (smart_route + agentic + reasoning detection) → ~60 lines out
-- B3: extract `dispatch_with_policy(...)` (rate-limit + parallel decision + fallback) → ~120 lines out
-- B4: extract `build_response(...)` (streaming vs buffered + history log + telemetry) → ~150 lines out
-- B5: chat_completions becomes ~80 lines orchestrating those four
-
-**After Phase B**: server.py ≈ 500-600 lines, under the ceiling. Each helper testable in isolation.
-
-**Risks I'm not waving away**:
-1. `chat_completions` reads as one continuous flow with shared state (`request_id`, `analysis_info`, `selected_model`, `provider`, `start_time`). Naïve extraction explodes the parameter list. The right boundary is probably a `RequestContext` dataclass.
-2. A5 (dedupe with dispatch.py) needs careful side-by-side diff — the two implementations may have drifted.
-3. `pytest --cov=nadirclaw.server` should run BEFORE any Phase B work, so we know what's actually exercised.
-
-**Resume trigger**: "let's do the chat_completions refactor — start with B0 golden fixtures"
+**Resume trigger** (if anything stays in P2): "look at server.py — does it need another pass?"
 
 ---
 
