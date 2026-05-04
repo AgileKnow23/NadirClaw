@@ -100,17 +100,15 @@ server.py ended at **1107 lines** — over the 800 P10 ceiling, but every concer
 
 ## P3 — Nice-to-haves
 
-### P3-1. April 2026 statements (~5 min, after May 5-15)
-After each card's April cycle closes, download April PDFs into `Source Statements/`. Re-run ETL. /notas April page lights up.
+### P3-1. April 2026 statements (~5 min, after May 5-15) — 🚧 BLOCKED on Bryan
+After each card's April cycle closes, download April PDFs into `Source Statements/`. Re-run ETL. /notas April page lights up. Only AMEX 9125 has a parser today; the other 7 cards need their parser written first (P0-2) once their April PDF lands.
 **Resume trigger**: "I downloaded the April statements"
 
-### P3-2. In-dashboard `/documentation` route (~30 min)
-Render `docs/ops/*.md` as a Next.js page at `akdashboard.agent-buddy.ai/documentation`. Markdown-it or react-markdown. Pros: works without GitHub access. Cons: another thing to maintain.
-**Resume trigger**: "build the in-dashboard docs page"
+### P3-2. In-dashboard `/documentation` route — ✅ DONE 2026-05-04 (`c24814f` ak_dashboard)
+Renders `NadirClaw/docs/ops/{README,BACKLOG,HANDBOOK,FAQ}.md` at `akdashboard.agent-buddy.ai/[locale]/documentation`. Whitelisted slugs only (no path traversal); react-markdown + remark-gfm so tables render. Nav link added. 6 vitest cases pin the read-layer contract.
 
-### P3-3. Statement-coverage chips on Home page (~15 min)
-Surface the same per-account match rate from /notas at the top of Home. Quick visual signal of "is my data complete this month?"
-**Resume trigger**: "add coverage chips to home"
+### P3-3. Statement-coverage chips on Home page — ✅ DONE 2026-05-04 (`8ddf3d2` ak_dashboard)
+Per-account match-rate chips now show at the top of Home for the AK tenant (last completed month). Reuses the same amber/sky/emerald rule as `/notas` via a shared `coverageChipClass` helper; click the bar to drill into `/notas`. 6 vitest cases pin the color rule.
 
 ### P3-4. Receipt OCR backfill (separate, ask Bryan)
 The receipts page exists but no recent automation context — likely candidate for review.
