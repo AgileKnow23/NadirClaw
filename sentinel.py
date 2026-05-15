@@ -689,7 +689,12 @@ def write_state(results: dict[str, tuple[bool, str]], recovery_count: int) -> No
 
 def main() -> int:
     log(f"sentinel starting — poll={POLL_SECONDS}s max_recoveries/hr={MAX_RECOVERIES_PER_HOUR}")
-    svc_summary = ", ".join(f"{n} (:{c['port']})" for n, c in SERVICES.items())
+    svc_summary = ", ".join(
+        # Non-HTTP services (e.g. github_runner) carry no port. Print the
+        # service name alone for those.
+        f"{n} (:{c['port']})" if "port" in c else n
+        for n, c in SERVICES.items()
+    )
     log(f"  monitoring: {svc_summary}")
     send_telegram("*NadirClaw Sentinel*: started, monitoring every 60s")
 
