@@ -102,6 +102,16 @@ SERVICES = {
         "health_key": "readyConnections",
         "health_min": 1,
     },
+    "github_runner": {
+        # GitHub Actions self-hosted runner for AgileKnow23/mealsmaker-app.
+        # No local HTTP port — check_service() bypasses HTTP for this entry
+        # via the "check_type": "wsl_process" branch. Health = the
+        # Runner.Listener process exists inside the Ubuntu WSL distro.
+        "check_type": "wsl_process",
+        "wsl_distro": "Ubuntu",
+        "wsl_user": "agile",
+        "process_pattern": "Runner.Listener",
+    },
 }
 
 
@@ -180,6 +190,38 @@ def _record_recovery() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _check_wsl_process(cfg: dict) -> tuple[bool, str]:
+    """Health check for a long-running process inside a WSL distro.
+
+    Used for github_runner — no local port to probe, but if the
+    Runner.Listener process is alive inside the Ubuntu distro then
+    the runner is connected to GitHub and ready for jobs.
+
+    Implementation: `wsl.exe -d <distro> -u <user> -- pgrep -f <pattern>`.
+    Returns (True, "PID <n>") if found, (False, reason) otherwise.
+    If WSL itself is down (distro not running, command times out), this
+    treats it as "process not running" so the remediation path will
+    start the Scheduled Task, which boots WSL and re-launches the
+    runner in one shot.
+    """
+    distro = cfg.get("wsl_distro", "Ubuntu")
+    user = cfg.get("wsl_user", "agile")
+    pattern = cfg.get("process_pattern", "Runner.Listener")
+    try:
+        res = subprocess.run(
+            ["wsl.exe", "-d", distro, "-u", user, "--", "pgrep", "-f", pattern],
+            capture_output=True, text=True, timeout=10,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            pid = res.stdout.strip().splitlines()[0]
+            return True, f"PID {pid}"
+        return False, "no Runner.Listener process in WSL"
+    except subprocess.TimeoutExpired:
+        return False, "wsl pgrep timed out"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {str(exc)[:100]}"
+
+
 def check_service(name: str, cfg: dict) -> tuple[bool, str]:
     """Return (healthy, reason). HTTP GET with optional body checks.
 
@@ -192,7 +234,13 @@ def check_service(name: str, cfg: dict) -> tuple[bool, str]:
                                        the tunnel is degraded — we want
                                        to read that body, not fail-open
                                        on the status code alone).
+
+    Non-HTTP services dispatch on cfg["check_type"]:
+      "wsl_process" — pgrep inside a named WSL distro for a long-running
+                       process. Used by github_runner (no local port).
     """
+    if cfg.get("check_type") == "wsl_process":
+        return _check_wsl_process(cfg)
     url = cfg["health_url"]
     has_min = "health_min" in cfg
     try:
@@ -471,10 +519,28 @@ def restart_ollama() -> bool:
         return False
 
 
+_NSSM_CANDIDATES = (
+    r"C:\Users\Agile\AppData\Local\Microsoft\WinGet\Links\nssm.exe",
+    r"C:\Users\Agile\AppData\Local\Microsoft\WinGet\Packages\NSSM.NSSM_Microsoft.Winget.Source_8wekyb3d8bbwe\nssm-2.24-101-g897c7ad\win64\nssm.exe",
+    r"C:\Program Files\nssm\nssm.exe",
+    r"C:\ProgramData\chocolatey\bin\nssm.exe",
+)
+
+
+def _resolve_nssm() -> str:
+    found = shutil.which("nssm")
+    if found:
+        return found
+    for cand in _NSSM_CANDIDATES:
+        if os.path.exists(cand):
+            return cand
+    return "nssm"
+
+
 def _restart_windows_service(svc_name: str) -> bool:
     """nssm restart <svc>. NSSM handles kill + relaunch + log rotation cleanly."""
     try:
-        nssm = shutil.which("nssm") or "nssm"
+        nssm = _resolve_nssm()
         res = subprocess.run(
             [nssm, "restart", svc_name],
             capture_output=True, text=True, timeout=30,
@@ -548,6 +614,39 @@ def restart_cloudflared() -> bool:
         return False
 
 
+def restart_github_runner() -> bool:
+    """Restart the GitHub Actions self-hosted runner.
+
+    The runner lives inside WSL Ubuntu and is normally launched by the
+    Windows Scheduled Task "MealsmakerActionsRunner" on user logon (and,
+    once Bryan adds the AtStartup trigger, also on Windows boot). When
+    the Runner.Listener process disappears, the cleanest recovery is to
+    trigger the same Scheduled Task again — it relaunches wsl.exe under
+    the user account WSL requires (LocalSystem is blocked by Microsoft:
+    Wsl/WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED).
+    """
+    log("  restarting GitHub Actions runner (schtasks /Run MealsmakerActionsRunner)...")
+    try:
+        res = subprocess.run(
+            ["schtasks", "/Run", "/TN", "MealsmakerActionsRunner"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if res.returncode != 0:
+            log(f"  schtasks /Run failed: rc={res.returncode} {res.stderr.strip()[:200]}")
+            return False
+        # WSL cold boot + runner connect to GitHub: usually <15s
+        time.sleep(15)
+        healthy, reason = check_service("github_runner", SERVICES["github_runner"])
+        if healthy:
+            log(f"  GitHub runner restart OK ({reason})")
+            return True
+        log(f"  GitHub runner restart — still unhealthy: {reason}")
+        return False
+    except Exception as exc:
+        log(f"  GitHub runner restart exception: {exc}")
+        return False
+
+
 RESTART_FNS = {
     "nadirclaw": restart_nadirclaw,
     "surrealdb": restart_surrealdb,
@@ -555,6 +654,7 @@ RESTART_FNS = {
     "ak_dashboard": restart_ak_dashboard,
     "status_app": restart_status_app,
     "cloudflared": restart_cloudflared,
+    "github_runner": restart_github_runner,
 }
 
 
