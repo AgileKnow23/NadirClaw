@@ -47,9 +47,11 @@ class TestServiceConfigs:
         configs = get_service_configs()
         assert "nadirclaw" in configs["NadirClaw-Router"]["args"]
 
-    def test_surrealdb_args_contain_bind(self):
+    def test_surrealdb_binds_loopback_only_and_keeps_credentials_off_the_command_line(self):
         configs = get_service_configs()
-        assert "0.0.0.0:8000" in configs["NadirClaw-SurrealDB"]["args"]
+        args = configs["NadirClaw-SurrealDB"]["args"]
+        assert "127.0.0.1:8000" in args and "0.0.0.0" not in args
+        assert "--user" not in args and "--pass" not in args
 
     def test_surrealdb_data_dir_uses_forward_slashes(self):
         configs = get_service_configs()

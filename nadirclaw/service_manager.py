@@ -77,10 +77,13 @@ def get_service_configs() -> Dict[str, Dict[str, Any]]:
         "NadirClaw-SurrealDB": {
             "exe": str(surreal) if surreal else "surreal.exe",
             "args": (
-                f"start --log info --user root --pass root "
-                f"--bind 0.0.0.0:8000 "
+                f"start --log info "
+                f"--bind 127.0.0.1:8000 "
                 f"rocksdb://{str(data_dir).replace(chr(92), '/')}"
             ),
+            # Read at install time from settings (env or the private config);
+            # passed to the service environment, never the command line.
+            "env_from_settings": {"SURREAL_USER": "SURREALDB_USER", "SURREAL_PASS": "SURREALDB_PASS"},
             "description": "NadirClaw SurrealDB instance",
             "depends_on": None,
         },
@@ -131,6 +134,18 @@ def build_install_commands(name: str, config: Dict[str, Any]) -> List[List[str]]
 
     # Working directory
     commands.append([nssm, "set", name, "AppDirectory", str(NADIRCLAW_DIR)])
+
+    # Service environment (credentials stay off the command line)
+    env_map = config.get("env_from_settings") or {}
+    if env_map:
+        from nadirclaw.settings import settings
+        values = {var: getattr(settings, attr) for var, attr in env_map.items()}
+        missing = sorted(var for var, value in values.items() if not value)
+        if missing:
+            raise ValueError(f"{name}: set {', '.join(missing)} via NADIRCLAW_SURREALDB_USER/PASS "
+                             "or the private SurrealDB config before installing")
+        commands.append([nssm, "set", name, "AppEnvironmentExtra",
+                         *[f"{var}={value}" for var, value in values.items()]])
 
     # Service dependency
     if config.get("depends_on"):
