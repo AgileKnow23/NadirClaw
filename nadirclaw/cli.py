@@ -135,15 +135,16 @@ def start(port, verbose):
     db_url = f"rocksdb://{str(data_dir).replace(chr(92), '/')}"
 
     click.echo(f"Starting SurrealDB ({db_url}) ...")
+    # Credentials go through the environment (SURREAL_USER / SURREAL_PASS),
+    # not the command line; the server listens on loopback only.
     surreal_proc = subprocess.Popen(
         [
             str(surreal), "start",
             "--no-banner", "--log", "warn",
-            "--user", settings.SURREALDB_USER,
-            "--pass", settings.SURREALDB_PASS,
-            "--bind", "0.0.0.0:8000",
+            "--bind", "127.0.0.1:8000",
             db_url,
         ],
+        env=dict(os.environ, SURREAL_USER=settings.SURREALDB_USER, SURREAL_PASS=settings.SURREALDB_PASS),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )

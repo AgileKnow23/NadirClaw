@@ -114,7 +114,14 @@ if (-not $NadirClawCmd) {
 
         # Install SurrealDB service
         Write-Host "Installing NadirClaw-SurrealDB..."
-        & $NssmExe install NadirClaw-SurrealDB $SurrealExe "start --log info --user root --pass root --bind 0.0.0.0:8000 file://$DataDir"
+        # Credentials come from the environment, never this script, and reach the
+        # service through its environment, not its command line. Loopback only.
+        if (-not $env:NADIRCLAW_SURREALDB_USER -or -not $env:NADIRCLAW_SURREALDB_PASS) {
+            Write-Error "Set NADIRCLAW_SURREALDB_USER and NADIRCLAW_SURREALDB_PASS first."
+            exit 1
+        }
+        & $NssmExe install NadirClaw-SurrealDB $SurrealExe "start --log info --bind 127.0.0.1:8000 file://$DataDir"
+        & $NssmExe set NadirClaw-SurrealDB AppEnvironmentExtra "SURREAL_USER=$env:NADIRCLAW_SURREALDB_USER" "SURREAL_PASS=$env:NADIRCLAW_SURREALDB_PASS"
         & $NssmExe set NadirClaw-SurrealDB Description "NadirClaw SurrealDB instance"
         & $NssmExe set NadirClaw-SurrealDB AppStdout (Join-Path $LogDir "NadirClaw-SurrealDB.log")
         & $NssmExe set NadirClaw-SurrealDB AppStderr (Join-Path $LogDir "NadirClaw-SurrealDB-error.log")
