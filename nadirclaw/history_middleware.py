@@ -16,11 +16,20 @@ import base64
 from datetime import datetime, timezone
 from typing import Any
 
-# SurrealDB config (same as session-history system)
-SURREAL_URL = "http://127.0.0.1:8000/sql"
+# SurrealDB: same server and credentials as the rest of NadirClaw (settings).
 SURREAL_NS = "claude"
 SURREAL_DB = "history"
-SURREAL_AUTH = base64.b64encode(b"root:root").decode()
+
+
+def _surreal_auth() -> str:
+    from nadirclaw.settings import settings
+    token = f"{settings.SURREALDB_USER}:{settings.SURREALDB_PASS}".encode()
+    return base64.b64encode(token).decode()
+
+
+def _surreal_sql_url() -> str:
+    from nadirclaw.settings import settings
+    return settings.SURREALDB_HTTP_URL + "/sql"
 
 # Ollama config
 OLLAMA_URL = "http://127.0.0.1:11434/api/embed"
@@ -33,9 +42,9 @@ def _surreal_execute(sql: str) -> bool:
     headers = {
         "Accept": "application/json",
         "Content-Type": "text/plain",
-        "Authorization": f"Basic {SURREAL_AUTH}",
+        "Authorization": f"Basic {_surreal_auth()}",
     }
-    req = urllib.request.Request(SURREAL_URL, data=full_sql.encode(), headers=headers, method="POST")
+    req = urllib.request.Request(_surreal_sql_url(), data=full_sql.encode(), headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
             body = json.loads(resp.read().decode())

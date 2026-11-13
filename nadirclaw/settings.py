@@ -1,5 +1,6 @@
 """Minimal env-based configuration for NadirClaw."""
 
+import json
 import os
 from pathlib import Path
 
@@ -13,6 +14,42 @@ if _env_file.exists():
 else:
     # Fallback to current directory .env
     load_dotenv()
+
+
+#: One SurrealDB for the machine, at an explicit address. "localhost" is not
+#: used: it resolved to a second server on [::1] on this machine.
+DEFAULT_SURREALDB_URL = "ws://127.0.0.1:8000"
+_SURREAL_CONFIG_MAX_BYTES = 64 * 1024
+
+
+def surreal_private_config() -> dict:
+    """The private SurrealDB config shared by local clients (outside Git):
+    SURREALDB_CONFIG or ~/.gcreds/surrealdb.json. Its ``clients.nadirclaw``
+    entry wins over top-level keys. {} when absent or unreadable; values are
+    never logged."""
+    path = Path(os.getenv("SURREALDB_CONFIG") or (Path.home() / ".gcreds" / "surrealdb.json"))
+    try:
+        if not path.is_file() or path.stat().st_size > _SURREAL_CONFIG_MAX_BYTES:
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    clients = data.get("clients")
+    entry = clients.get("nadirclaw") if isinstance(clients, dict) else None
+    merged = {k: v for k, v in data.items() if k != "clients"}
+    merged.update(entry if isinstance(entry, dict) else {})
+    return merged
+
+
+def _ws_url(url: str) -> str:
+    url = url.rstrip("/")
+    if url.startswith("http://"):
+        return "ws://" + url[len("http://"):]
+    if url.startswith("https://"):
+        return "wss://" + url[len("https://"):]
+    return url
 
 
 class Settings:
@@ -97,7 +134,17 @@ class Settings:
 
     @property
     def SURREALDB_URL(self) -> str:
-        return os.getenv("NADIRCLAW_SURREALDB_URL", "ws://localhost:8000")
+        url = os.getenv("NADIRCLAW_SURREALDB_URL") or surreal_private_config().get("url") or DEFAULT_SURREALDB_URL
+        return _ws_url(str(url))
+
+    @property
+    def SURREALDB_HTTP_URL(self) -> str:
+        """Same server as SURREALDB_URL, for the HTTP /sql endpoint."""
+        url = self.SURREALDB_URL
+        for ws, http in (("wss://", "https://"), ("ws://", "http://")):
+            if url.startswith(ws):
+                url = http + url[len(ws):]
+        return url.removesuffix("/rpc")
 
     @property
     def SURREALDB_NS(self) -> str:
@@ -109,11 +156,13 @@ class Settings:
 
     @property
     def SURREALDB_USER(self) -> str:
-        return os.getenv("NADIRCLAW_SURREALDB_USER", "root")
+        """Env, then the private config; no built-in default."""
+        return os.getenv("NADIRCLAW_SURREALDB_USER") or str(surreal_private_config().get("user") or "")
 
     @property
     def SURREALDB_PASS(self) -> str:
-        return os.getenv("NADIRCLAW_SURREALDB_PASS", "root")
+        """Env, then the private config; no built-in default."""
+        return os.getenv("NADIRCLAW_SURREALDB_PASS") or str(surreal_private_config().get("password") or "")
 
     @property
     def SURREALDB_ENABLED(self) -> bool:
